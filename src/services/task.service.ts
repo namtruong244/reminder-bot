@@ -18,26 +18,29 @@ export class TaskService {
     timezone?: string;
   }): Promise<UserRecord> {
     const tz = user.timezone || DEFAULT_TZ;
-    const query = `
-      INSERT INTO users (telegram_id, username, timezone)
-      VALUES (?, ?, ?)
-      ON CONFLICT(telegram_id) DO UPDATE SET
-        username = excluded.username,
-        timezone = COALESCE(users.timezone, excluded.timezone)
-      RETURNING *;
-    `;
-    const result = await this.db
-      .prepare(query)
-      .bind(user.telegram_id, user.username || null, tz)
-      .first<UserRecord>();
+    const existing = await this.getUser(user.telegram_id);
 
-    if (!result) {
-      // Fallback if RETURNING is not supported
-      const fetched = await this.getUser(user.telegram_id);
-      if (!fetched) throw new Error('Failed to upsert user');
-      return fetched;
+    if (!existing) {
+      await this.db
+        .prepare(`INSERT OR IGNORE INTO users (telegram_id, username, timezone) VALUES (?, ?, ?);`)
+        .bind(user.telegram_id, user.username || null, tz)
+        .run();
+    } else if (user.username && user.username !== existing.username) {
+      await this.db
+        .prepare(`UPDATE users SET username = ? WHERE telegram_id = ?;`)
+        .bind(user.username, user.telegram_id)
+        .run();
     }
-    return result;
+
+    const fetched = await this.getUser(user.telegram_id);
+    if (!fetched) {
+      return {
+        telegram_id: user.telegram_id,
+        username: user.username,
+        timezone: tz,
+      };
+    }
+    return fetched;
   }
 
   async updateUserICloud(
@@ -87,11 +90,10 @@ export class TaskService {
       INSERT INTO tasks (
         id, user_id, title, description, due_at, remind_at,
         priority, status, recurrence_rule, nagging_mode, snooze_count, ios_synced
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      RETURNING *;
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
     `;
 
-    const result = await this.db
+    await this.db
       .prepare(query)
       .bind(
         task.id,
@@ -107,17 +109,27 @@ export class TaskService {
         snoozeCount,
         iosSynced
       )
-      .first<TaskRecord>();
+      .run();
 
-    if (!result) {
-      const fetched = await this.getTaskById(task.id);
-      if (!fetched) throw new Error('Failed to create task');
-      return fetched;
+    const fetched = await this.getTaskById(task.id);
+    if (!fetched) {
+      return {
+        id: task.id,
+        user_id: task.user_id,
+        title: task.title,
+        description: task.description,
+        due_at: task.due_at,
+        remind_at: task.remind_at,
+        priority,
+        status,
+        recurrence_rule: task.recurrence_rule,
+        nagging_mode: naggingMode,
+        snooze_count: snoozeCount,
+        ios_synced: iosSynced,
+      };
     }
-
-    return result;
+    return fetched;
   }
-
   async getTaskById(taskId: string): Promise<TaskRecord | null> {
     const query = `SELECT * FROM tasks WHERE id = ? LIMIT 1;`;
     const result = await this.db.prepare(query).bind(taskId).first<TaskRecord>();
@@ -209,25 +221,23 @@ export class TaskService {
             status = 'PENDING',
             snooze_count = 0,
             updated_at = datetime('now')
-        WHERE id = ?
-        RETURNING *;
+        WHERE id = ?;
       `;
-      const result = await this.db
+      await this.db
         .prepare(query)
         .bind(nextRecurrence.dueAt, nextRecurrence.remindAt, taskId)
-        .first<TaskRecord>();
-      return result || null;
+        .run();
+      return this.getTaskById(taskId);
     }
 
     const query = `
       UPDATE tasks
       SET status = 'COMPLETED',
           updated_at = datetime('now')
-      WHERE id = ?
-      RETURNING *;
+      WHERE id = ?;
     `;
-    const result = await this.db.prepare(query).bind(taskId).first<TaskRecord>();
-    return result || null;
+    await this.db.prepare(query).bind(taskId).run();
+    return this.getTaskById(taskId);
   }
 
   /**
@@ -239,11 +249,10 @@ export class TaskService {
       SET remind_at = ?,
           snooze_count = snooze_count + 1,
           updated_at = datetime('now')
-      WHERE id = ?
-      RETURNING *;
+      WHERE id = ?;
     `;
-    const result = await this.db.prepare(query).bind(newRemindAt, taskId).first<TaskRecord>();
-    return result || null;
+    await this.db.prepare(query).bind(newRemindAt, taskId).run();
+    return this.getTaskById(taskId);
   }
 
   /**

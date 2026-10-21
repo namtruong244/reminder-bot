@@ -63,7 +63,7 @@ export class BotCommands {
     const welcome = `
 👋 *Xin chào! Tôi là Trợ lý Nhắc việc Thông minh.*
 
-Tôi giúp bạn quản lý công việc và đồng bộ với **Apple Reminders / Calendar**:
+Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders / Calendar*:
 • 💬 Nhắn tự nhiên bằng tiếng Việt (VD: _"Nhắc tôi 3h chiều mai gửi hợp đồng cho khách, việc gấp"_).
 • 🔔 Tự động đẩy thông báo nhắc việc đúng giờ trên Telegram.
 • 📱 Đồng bộ hai chiều với iPhone (iCloud CalDAV hoặc Shortcuts).

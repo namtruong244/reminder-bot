@@ -15,6 +15,7 @@ describe('TaskService', () => {
       prepare: vi.fn().mockReturnValue({
         bind: vi.fn().mockReturnValue({
           first: vi.fn().mockResolvedValue(mockUser),
+          run: vi.fn().mockResolvedValue({ success: true }),
         }),
       }),
     } as unknown as D1Database; // Mock D1 for unit testing
@@ -48,6 +49,7 @@ describe('TaskService', () => {
       prepare: vi.fn().mockReturnValue({
         bind: vi.fn().mockReturnValue({
           first: vi.fn().mockResolvedValue(sampleTask),
+          run: vi.fn().mockResolvedValue({ success: true }),
         }),
       }),
     } as unknown as D1Database; // Mock D1 for unit testing

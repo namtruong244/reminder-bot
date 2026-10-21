@@ -76,7 +76,7 @@ export class TelegramWebhookHandler {
           // Ignore secondary send failures
         }
       }
-      return c.text(`Internal Error: ${errorMsg}`, 500);
+      return c.text(`Internal Handled Error: ${errorMsg}`, 200);
     }
 
     return c.text('OK', 200);

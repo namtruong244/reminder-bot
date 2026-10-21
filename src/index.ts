@@ -76,6 +76,16 @@ app.get('/api/webhook-info', async (c) => {
     return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 });
+// Test sending a message from Worker to verify bot token and reachability
+app.post('/api/test-message', async (c) => {
+  const { chat_id, text } = await c.req.json<{ chat_id?: number | string; text?: string }>();
+  if (!chat_id) {
+    return c.json({ error: 'Missing chat_id in JSON body' }, 400);
+  }
+  const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
+  const res = await telegram.sendMessage(chat_id, text || '🔔 Test message from Worker!');
+  return c.json({ success: !!res, result: res });
+});
 
 // Quick endpoint to apply D1 schema migration directly
 app.post('/api/migrate', async (c) => {
