@@ -6,7 +6,7 @@ compatibility_date = "2025-02-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "reminder_bot_db"
-database_id = "preview-reminder-bot-db"
+database_id = "d5239e8d-660e-4a89-8f51-0ca67757173f"
 
 # Cron Triggers:
 # 1. Runs every minute to scan pending tasks and send notifications
