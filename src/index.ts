@@ -38,6 +38,96 @@ app.post('/api/setup-webhook', async (c) => {
     error_code: result.error_code,
   });
 });
+// Diagnostic endpoint to check Telegram status and Database health
+app.get('/api/webhook-info', async (c) => {
+  if (!c.env.TELEGRAM_BOT_TOKEN) {
+    return c.json({ error: 'TELEGRAM_BOT_TOKEN is not configured in Worker secrets.' }, 500);
+  }
+
+  let dbHealthy = false;
+  let dbError: string | null = null;
+  let userCount = 0;
+  try {
+    const res = await c.env.DB.prepare('SELECT count(*) as count FROM users;').first<{ count: number }>();
+    dbHealthy = true;
+    userCount = res?.count ?? 0;
+  } catch (err) {
+    dbError = err instanceof Error ? err.message : String(err);
+  }
+
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${c.env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+    const telegramInfo = await res.json();
+    return c.json({
+      telegram: telegramInfo,
+      database: {
+        healthy: dbHealthy,
+        userCount,
+        error: dbError,
+      },
+      secrets_configured: {
+        TELEGRAM_BOT_TOKEN: !!c.env.TELEGRAM_BOT_TOKEN,
+        TELEGRAM_WEBHOOK_SECRET: !!c.env.TELEGRAM_WEBHOOK_SECRET,
+        GEMINI_API_KEY: !!c.env.GEMINI_API_KEY,
+        ENCRYPTION_SECRET_KEY: !!c.env.ENCRYPTION_SECRET_KEY,
+      },
+    });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
+
+// Quick endpoint to apply D1 schema migration directly
+app.post('/api/migrate', async (c) => {
+  const secretKey = c.req.header('X-Admin-Key');
+  if (c.env.ENCRYPTION_SECRET_KEY && secretKey !== c.env.ENCRYPTION_SECRET_KEY) {
+    return c.text('Unauthorized', 401);
+  }
+
+  const schema = `
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_id INTEGER PRIMARY KEY,
+        username TEXT,
+        timezone TEXT DEFAULT 'Asia/Ho_Chi_Minh',
+        icloud_apple_id TEXT,
+        icloud_app_password_enc TEXT,
+        icloud_calendar_url TEXT,
+        sync_token TEXT,
+        morning_brief_time TEXT DEFAULT '08:00',
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        due_at TEXT NOT NULL,
+        remind_at TEXT NOT NULL,
+        priority TEXT DEFAULT 'MEDIUM' CHECK(priority IN ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')),
+        status TEXT DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'COMPLETED', 'CANCELLED')),
+        recurrence_rule TEXT,
+        nagging_mode INTEGER DEFAULT 0,
+        snooze_count INTEGER DEFAULT 0,
+        caldav_etag TEXT,
+        ios_synced INTEGER DEFAULT 0,
+        last_notified_at TEXT,
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now')),
+        FOREIGN KEY (user_id) REFERENCES users(telegram_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tasks_due_scan ON tasks(status, remind_at);
+    CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status);
+  `;
+
+  try {
+    await c.env.DB.exec(schema);
+    return c.json({ success: true, message: 'D1 database schema applied successfully!' });
+  } catch (err) {
+    return c.json({ success: false, error: err instanceof Error ? err.message : String(err) }, 500);
+  }
+});
 
 // ================= ADAPTER B: iOS Shortcuts REST Bridge =================
 

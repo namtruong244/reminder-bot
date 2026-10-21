@@ -37,6 +37,7 @@ export class TelegramWebhookHandler {
     if (expectedSecret) {
       const headerSecret = c.req.header('X-Telegram-Bot-Api-Secret-Token');
       if (headerSecret !== expectedSecret) {
+        console.warn(`Telegram secret token mismatch. Expected: ${expectedSecret}, got: ${headerSecret}`);
         return c.text('Unauthorized', 401);
       }
     }
@@ -48,16 +49,34 @@ export class TelegramWebhookHandler {
       return c.text('Invalid JSON', 400);
     }
 
-    // 2. Handle Message
-    if (update.message) {
-      await this.handleMessage(c, update.message);
-      return c.text('OK', 200);
-    }
+    try {
+      // 2. Handle Message
+      if (update.message) {
+        await this.handleMessage(c, update.message);
+        return c.text('OK', 200);
+      }
 
-    // 3. Handle Callback Query (Inline Keyboard Buttons)
-    if (update.callback_query) {
-      await this.handleCallbackQuery(c, update.callback_query);
-      return c.text('OK', 200);
+      // 3. Handle Callback Query (Inline Keyboard Buttons)
+      if (update.callback_query) {
+        await this.handleCallbackQuery(c, update.callback_query);
+        return c.text('OK', 200);
+      }
+    } catch (err) {
+      console.error('Unhandled error in Telegram webhook handler:', err);
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      const chatId = update.message?.chat.id || update.callback_query?.message?.chat.id;
+      if (chatId) {
+        try {
+          await this.telegram.sendMessage(
+            chatId,
+            `⚠️ *Lỗi xử lý:* \`${errorMsg}\`\n\nVui lòng thử lại hoặc gõ /start để khởi tạo.`,
+            { parse_mode: 'Markdown' }
+          );
+        } catch {
+          // Ignore secondary send failures
+        }
+      }
+      return c.text(`Internal Error: ${errorMsg}`, 500);
     }
 
     return c.text('OK', 200);
