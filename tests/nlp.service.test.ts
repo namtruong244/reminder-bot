@@ -24,4 +24,19 @@ describe('NlpService', () => {
     expect(result.priority).toBe('MEDIUM');
     expect(result.due_at_iso).toBeDefined();
   });
+
+  it('extracts "Uống nước 10p nữa" correctly', async () => {
+    const result = await service.parseUserPrompt('Uống nước 10p nữa');
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toContain('Uống nước');
+    expect(result.remind_before_minutes).toBe(0);
+    expect(result.due_at_iso).toBeDefined();
+  });
+
+  it('extracts "4 rưỡi chiều nay" correctly', async () => {
+    const result = await service.parseUserPrompt('Nhắc sau 4 rưỡi chiều nay nộp báo cáo');
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toContain('nộp báo cáo');
+    expect(result.due_at_iso).toContain('T16:30:00+07:00');
+  });
 });

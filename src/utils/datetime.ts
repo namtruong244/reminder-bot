@@ -79,13 +79,34 @@ export function getTimezoneOffsetString(date: Date = new Date(), timezone: strin
 
 /**
  * Parses any ISO string (or Date) and returns standard UTC ISO string (e.g., "2026-10-21T08:00:00.000Z").
+ * If the input string has no timezone offset, it is assumed to be in the user's timezone.
  */
-export function toUtcIso(input: string | Date): string {
-  const date = typeof input === 'string' ? new Date(input) : input;
-  if (isNaN(date.getTime())) {
+export function toUtcIso(input: string | Date, timezone: string = DEFAULT_TZ): string {
+  if (input instanceof Date) {
+    return input.toISOString();
+  }
+
+  const str = input.trim();
+  // If string already has explicit offset: +HH:MM, -HH:MM, or ends with Z
+  if (/(?:[+-]\d{2}:?\d{2}|Z)$/i.test(str)) {
+    const d = new Date(str);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+
+  // If no timezone offset (e.g. "2026-10-21T16:30:00" or "2026-10-21 16:30:00")
+  const offset = getTimezoneOffsetString(new Date(), timezone);
+  const normalized = str.replace(' ', 'T');
+  const withOffset = `${normalized}${offset}`;
+  const d = new Date(withOffset);
+  if (!isNaN(d.getTime())) {
+    return d.toISOString();
+  }
+
+  const fallback = new Date(str);
+  if (isNaN(fallback.getTime())) {
     throw new Error(`Invalid date input: ${input}`);
   }
-  return date.toISOString();
+  return fallback.toISOString();
 }
 
 /**

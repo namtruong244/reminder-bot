@@ -129,7 +129,7 @@ export class TelegramWebhookHandler {
       let dueAtUtc: string;
       if (nlpResult.due_at_iso) {
         try {
-          dueAtUtc = toUtcIso(nlpResult.due_at_iso);
+          dueAtUtc = toUtcIso(nlpResult.due_at_iso, tz);
         } catch {
           dueAtUtc = addMinutes(new Date(), 30);
         }
@@ -137,13 +137,21 @@ export class TelegramWebhookHandler {
         dueAtUtc = addMinutes(new Date(), 30);
       }
 
-      // Calculate remind_at
-      const remindBeforeMin = nlpResult.remind_before_minutes ?? 15;
+      // Calculate remind_at intelligently
+      const nowMs = Date.now();
+      const dueMs = new Date(dueAtUtc).getTime();
+      const diffMinutes = Math.round((dueMs - nowMs) / 60000);
+
+      // If user scheduled something soon (<= 30 mins) or remindBefore would be in the past, ring exactly on time
+      let remindBeforeMin = nlpResult.remind_before_minutes ?? (diffMinutes > 45 ? 15 : 0);
+      if (diffMinutes <= 30 || diffMinutes <= remindBeforeMin) {
+        remindBeforeMin = 0;
+      }
+
       const remindAtUtc =
         remindBeforeMin > 0
           ? addMinutes(dueAtUtc, -remindBeforeMin)
           : dueAtUtc;
-
       const priority = nlpResult.priority || 'MEDIUM';
       const nagging = nlpResult.nagging_mode ? 1 : 0;
 
