@@ -102,21 +102,55 @@ export class TelegramApi {
     }
   }
 
-  async setWebhook(url: string, secretToken?: string): Promise<boolean> {
+  async setWebhook(
+    url: string,
+    secretToken?: string
+  ): Promise<{ success: boolean; description?: string; error_code?: number }> {
+    if (!this.token) {
+      return {
+        success: false,
+        description: 'TELEGRAM_BOT_TOKEN is not configured on Cloudflare Worker Secrets.',
+      };
+    }
+
     const payload: Record<string, unknown> = {
       url,
       allowed_updates: ['message', 'callback_query'],
     };
-    if (secretToken) {
-      payload.secret_token = secretToken;
+
+    if (secretToken && secretToken.trim().length > 0) {
+      payload.secret_token = secretToken.trim();
     }
 
-    const res = await fetch(`${this.baseUrl}/setWebhook`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    try {
+      const res = await fetch(`${this.baseUrl}/setWebhook`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
 
-    return res.ok;
+      const data = (await res.json()) as {
+        ok: boolean;
+        description?: string;
+        error_code?: number;
+      };
+
+      if (!res.ok || !data.ok) {
+        console.error('Telegram setWebhook failed:', data);
+        return {
+          success: false,
+          description: data.description || `HTTP error ${res.status}`,
+          error_code: data.error_code || res.status,
+        };
+      }
+
+      return {
+        success: true,
+        description: data.description || 'Webhook was set successfully',
+      };
+    } catch (err) {
+      console.error('Error setting webhook:', err);
+      return { success: false, description: String(err) };
+    }
   }
 }

@@ -30,8 +30,13 @@ app.post('/api/setup-webhook', async (c) => {
   }
 
   const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
-  const ok = await telegram.setWebhook(webhook_url, c.env.TELEGRAM_WEBHOOK_SECRET);
-  return c.json({ success: ok, webhook_url });
+  const result = await telegram.setWebhook(webhook_url, c.env.TELEGRAM_WEBHOOK_SECRET);
+  return c.json({
+    success: result.success,
+    webhook_url,
+    description: result.description,
+    error_code: result.error_code,
+  });
 });
 
 // ================= ADAPTER B: iOS Shortcuts REST Bridge =================
