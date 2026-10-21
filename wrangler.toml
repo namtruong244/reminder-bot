@@ -16,4 +16,4 @@ crons = ["* * * * *", "0 1 * * *"]
 
 [vars]
 DEFAULT_TIMEZONE = "Asia/Ho_Chi_Minh"
-LLM_MODEL = "gemini-2.0-flash"
+LLM_MODEL = "gemini-3.8-flash"
