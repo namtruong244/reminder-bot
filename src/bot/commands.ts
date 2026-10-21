@@ -2,7 +2,6 @@ import { Env } from '../types/env';
 import { TelegramMessage } from '../types/task';
 import { TelegramApi } from './telegram';
 import { TaskService } from '../services/task.service';
-import { encryptText } from '../utils/crypto';
 import { formatDisplayDate, DEFAULT_TZ } from '../utils/datetime';
 import { createTaskListKeyboard } from './keyboards';
 
@@ -46,9 +45,6 @@ export class BotCommands {
         break;
       case '/timezone':
         await this.handleTimezone(chatId, userId, args.join(' '));
-        break;
-      case '/setup_icloud':
-        await this.handleSetupICloud(chatId, userId, args);
         break;
       default:
         await this.telegram.sendMessage(
@@ -94,11 +90,10 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
 • /sync: Kiểm tra đồng bộ iOS
 • /timezone <múi_giờ>: Đổi múi giờ (mặc định: \`Asia/Ho_Chi_Minh\`)
 
-3️⃣ *Cấu hình iCloud Reminders:*
-• Dùng lệnh: \`/setup_icloud <Apple_ID> <Mật_khẩu_ứng_dụng> <URL_CalDAV>\`
-• Mật khẩu được mã hóa an toàn bằng chuẩn AES-256-GCM.
+3️⃣ *Đồng bộ iOS Reminders:*
+• Các task tạo trên Telegram sẽ tự động sẵn sàng để đồng bộ về app Lời nhắc của iPhone thông qua Phím tắt (Shortcuts).
+• Dùng lệnh /sync để xem số lượng task đang chờ kéo về iPhone.
     `.trim();
-
     await this.telegram.sendMessage(chatId, help, { parse_mode: 'Markdown' });
   }
 
@@ -166,10 +161,11 @@ ${task.description ? `📝 ${task.description}` : ''}
     const userUnsynced = unsynced.filter((t) => t.user_id === userId);
 
     const text = `
-📱 *TRẠNG THÁI ĐỒNG BỘ iOS*
-• iCloud CalDAV Direct: ${hasICloud ? '✅ Đã cấu hình' : '❌ Chưa cấu hình (/setup_icloud)'}
-• Apple ID: ${user?.icloud_apple_id ? `\`${user.icloud_apple_id}\`` : 'Chưa có'}
-• Số task chờ đồng bộ iOS: *${userUnsynced.length}*
+📱 *TRẠNG THÁI ĐỒNG BỘ iOS REMINDERS*
+• Phương thức: iOS Shortcuts REST Bridge (Native Apple Reminders)
+• Số task đang chờ đồng bộ về iPhone: *${userUnsynced.length}*
+
+💡 _Mẹo: Mở app Lời nhắc trên iPhone để Phím tắt tự động kéo task về._
     `.trim();
 
     await this.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown' });
@@ -204,37 +200,4 @@ ${task.description ? `📝 ${task.description}` : ''}
     }
   }
 
-  private async handleSetupICloud(chatId: number, userId: number, args: string[]): Promise<void> {
-    if (args.length < 3) {
-      const syntax = `
-⚠️ *Cú pháp cấu hình iCloud:*
-\`/setup_icloud <Apple_ID> <App_Specific_Password> <CalDAV_URL>\`
-
-Ví dụ:
-\`/setup_icloud user@icloud.com abcd-efgh-ijkl-mnop https://caldav.icloud.com/...\`
-
-*Lưu ý an toàn:* Hãy tạo Mật khẩu Dành riêng cho Ứng dụng (App-Specific Password) tại appleid.apple.com, không dùng mật khẩu chính của tài khoản Apple. Mật khẩu sẽ được mã hóa AES-256-GCM.
-      `.trim();
-      await this.telegram.sendMessage(chatId, syntax, { parse_mode: 'Markdown' });
-      return;
-    }
-
-    const [appleId, appPassword, calendarUrl] = args;
-    const secretKey = this.env.ENCRYPTION_SECRET_KEY || 'default-fallback-32-byte-secret-key-32';
-
-    try {
-      const encryptedPassword = await encryptText(appPassword, secretKey);
-      await this.taskService.updateUserICloud(userId, appleId, encryptedPassword, calendarUrl);
-
-      await this.telegram.sendMessage(
-        chatId,
-        `✅ *Đã lưu thông tin kết nối iCloud CalDAV thành công!*
-Mật khẩu đã được mã hóa an toàn và sẵn sàng đồng bộ 2 chiều với Apple Reminders.`,
-        { parse_mode: 'Markdown' }
-      );
-    } catch (err) {
-      console.error('Error saving iCloud config:', err);
-      await this.telegram.sendMessage(chatId, '❌ Lỗi khi mã hóa và lưu thông tin iCloud.');
-    }
-  }
 }

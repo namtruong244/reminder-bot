@@ -5,7 +5,6 @@ import { TelegramApi } from './telegram';
 import { TaskService } from '../services/task.service';
 import { BotCommands } from './commands';
 import { NlpService } from '../services/nlp.service';
-import { ICloudService } from '../services/icloud.service';
 import { createTaskCreatedKeyboard } from './keyboards';
 import {
   toUtcIso,
@@ -21,14 +20,12 @@ export class TelegramWebhookHandler {
   private taskService: TaskService;
   private commands: BotCommands;
   private nlpService: NlpService;
-  private icloudService: ICloudService;
 
   constructor(private env: Env) {
     this.telegram = new TelegramApi(env.TELEGRAM_BOT_TOKEN);
     this.taskService = new TaskService(env.DB);
     this.commands = new BotCommands(env, this.telegram, this.taskService);
     this.nlpService = new NlpService(env.GEMINI_API_KEY, env.LLM_MODEL);
-    this.icloudService = new ICloudService(env.ENCRYPTION_SECRET_KEY);
   }
 
   async handleUpdate(c: Context<{ Bindings: Env }>): Promise<Response> {
@@ -93,6 +90,8 @@ export class TelegramWebhookHandler {
     const userId = message.from?.id || chatId;
     const username = message.from?.username || null;
 
+    // Send instant typing action so user knows bot is working immediately
+    c.executionCtx.waitUntil(this.telegram.sendChatAction(chatId, 'typing'));
     // Check if it is a bot command
     if (text.startsWith('/')) {
       await this.commands.handleCommand(message);
@@ -168,17 +167,6 @@ export class TelegramWebhookHandler {
         recurrence_rule: nlpResult.recurrence_rrule,
       });
 
-      // Background task: sync to iCloud CalDAV if configured
-      if (user.icloud_apple_id && user.icloud_app_password_enc) {
-        c.executionCtx.waitUntil(
-          (async () => {
-            const syncRes = await this.icloudService.syncTaskToCalDav(user, createdTask);
-            if (syncRes.success && syncRes.etag) {
-              await this.taskService.updateTaskCaldavEtag(taskId, syncRes.etag);
-            }
-          })()
-        );
-      }
 
       // Format confirmation response
       const priorityLabel =
@@ -255,12 +243,6 @@ export class TelegramWebhookHandler {
       } else {
         await this.taskService.completeTask(taskId);
 
-        // Sync to iCloud in background
-        if (user && user.icloud_apple_id) {
-          c.executionCtx.waitUntil(
-            this.icloudService.syncTaskToCalDav(user, task, 'COMPLETED')
-          );
-        }
 
         if (messageId) {
           const editMsg = `✅ *Đã hoàn thành:* ${task.title} (lúc ${formatDisplayDate(new Date().toISOString(), tz)})`;
@@ -317,10 +299,6 @@ export class TelegramWebhookHandler {
 
       await this.taskService.cancelTask(taskId);
 
-      // Delete from iCloud in background
-      if (user && user.icloud_apple_id) {
-        c.executionCtx.waitUntil(this.icloudService.deleteTaskFromCalDav(user, taskId));
-      }
 
       if (messageId) {
         const editMsg = `🗑 *Đã hủy nhắc việc:* ~${task.title}~`;

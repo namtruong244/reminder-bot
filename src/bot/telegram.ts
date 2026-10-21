@@ -101,6 +101,19 @@ export class TelegramApi {
       return false;
     }
   }
+  async sendChatAction(chatId: number | string, action: 'typing' = 'typing'): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/sendChatAction`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, action }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
 
   async setWebhook(
     url: string,

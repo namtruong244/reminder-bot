@@ -38,11 +38,16 @@ export class NlpService {
     const currentIso = getNowWithTimezone(new Date(), timezone);
     const dayOfWeek = getVietnameseDayOfWeek(new Date(), timezone);
 
-    // Fallback if no API key is provided
+    // 1. FAST-PATH: Run local regex parser (< 1ms). Resolves common phrases instantly with 0 latency!
+    const fastResult = this.fastPatternParse(text, currentIso);
+    if (fastResult) {
+      return fastResult;
+    }
+
+    // 2. Fallback to Gemini if no fast pattern match and no API key
     if (!this.apiKey) {
       return this.heuristicFallback(text, currentIso);
     }
-
     const systemPrompt = `
 Bạn là trợ lý AI chuyên phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
 Thời gian hệ thống hiện tại tại Việt Nam là: ${currentIso} (${dayOfWeek}).
@@ -103,6 +108,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
+        signal: AbortSignal.timeout(3500),
       });
 
       if (!response.ok) {
@@ -137,10 +143,25 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    * Lightweight deterministic parser for common phrases or offline fallback.
    */
   private heuristicFallback(text: string, currentIso: string): NlpExtractedTask {
-    const lower = text.toLowerCase();
+    return this.fastPatternParse(text, currentIso) || {
+      intent: 'CREATE_TASK',
+      title: text,
+      due_at_iso: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      remind_before_minutes: 0,
+      priority: 'MEDIUM',
+      nagging_mode: false,
+      recurrence_rrule: null,
+    };
+  }
+
+  /**
+   * Fast-path deterministic parser for common phrases. Returns null if pattern is complex/unmatched.
+   */
+  private fastPatternParse(text: string, currentIso: string): NlpExtractedTask | null {
+    const lower = text.toLowerCase().trim();
 
     // Intent detection
-    if (lower.startsWith('xem việc') || lower.includes('danh sách') || lower === 'list') {
+    if (/(?:xem\s+(?:danh\s+sách|việc)|danh\s+sách|list|\/list)/i.test(lower)) {
       return { intent: 'LIST_TASKS' };
     }
 
@@ -182,9 +203,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     }
 
     // 2. Check absolute time: "4 rưỡi chiều nay", "4h chiều", "16h30", "8h tối"
-    const chieuMatch = lower.match(/(\d+)(?:\s*(?:rưỡi|h30|:30))?\s*chiều/);
-    const toiMatch = lower.match(/(\d+)(?:\s*(?:rưỡi|h30|:30))?\s*tối/);
-    const sangMatch = lower.match(/(\d+)(?:\s*(?:rưỡi|h30|:30))?\s*sáng/);
+    const chieuMatch = lower.match(/(\d+)(?:\s*(?:rưỡi|h30|:30|h))?\s*chiều/);
+    const toiMatch = lower.match(/(\d+)(?:\s*(?:rưỡi|h30|:30|h))?\s*tối/);
+    const sangMatch = lower.match(/(\d+)(?:\s*(?:rưỡi|h30|:30|h))?\s*sáng/);
+    const hourMatch = lower.match(/(?:lúc\s+)?(\d{1,2})h(?:(\d{2}))?/);
 
     let targetHour: number | null = null;
     let targetMinute = 0;
@@ -202,6 +224,9 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     } else if (sangMatch) {
       targetHour = parseInt(sangMatch[1], 10);
       if (lower.includes('rưỡi') || lower.includes('30')) targetMinute = 30;
+    } else if (hourMatch) {
+      targetHour = parseInt(hourMatch[1], 10);
+      if (hourMatch[2]) targetMinute = parseInt(hourMatch[2], 10);
     }
 
     if (targetHour !== null) {
@@ -209,14 +234,23 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       const now = new Date();
       if (isTomorrow) now.setDate(now.getDate() + 1);
 
-      const dateStr = now.toISOString().split('T')[0];
+      const parts = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }).formatToParts(now);
+      const lk: Record<string, string> = {};
+      for (const p of parts) lk[p.type] = p.value;
+
       const hStr = targetHour.toString().padStart(2, '0');
       const mStr = targetMinute.toString().padStart(2, '0');
-      const localIso = `${dateStr}T${hStr}:${mStr}:00+07:00`;
+      const localIso = `${lk.year}-${lk.month}-${lk.day}T${hStr}:${mStr}:00+07:00`;
 
       const cleanTitle = text
         .replace(/nhắc (?:tôi|mình|em)?/i, '')
-        .replace(/(?:sau\s+)?\d+(?:\s*(?:rưỡi|h30|:30))?\s*(?:chiều|tối|sáng)(?:\s*nay|\s*mai)?/i, '')
+        .replace(/(?:sau\s+)?\d+(?:\s*(?:rưỡi|h30|:30|h))?\s*(?:chiều|tối|sáng)(?:\s*nay|\s*mai)?/i, '')
+        .replace(/(?:lúc\s+)?\d{1,2}h\d{0,2}/i, '')
         .replace(/gấp|khẩn|quan trọng/i, '')
         .trim();
 
@@ -231,14 +265,6 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       };
     }
 
-    return {
-      intent: 'CREATE_TASK',
-      title: text,
-      due_at_iso: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-      remind_before_minutes: 0,
-      priority,
-      nagging_mode: isCritical,
-      recurrence_rrule: null,
-    };
+    return null;
   }
 }
