@@ -1,0 +1,307 @@
+import { Context } from 'hono';
+import { Env } from '../types/env';
+import { TelegramUpdate } from '../types/task';
+import { TelegramApi } from './telegram';
+import { TaskService } from '../services/task.service';
+import { BotCommands } from './commands';
+import { NlpService } from '../services/nlp.service';
+import { ICloudService } from '../services/icloud.service';
+import { createTaskCreatedKeyboard } from './keyboards';
+import {
+  toUtcIso,
+  addMinutes,
+  formatDisplayDate,
+  calculateNextRecurrence,
+  getTomorrowMorningIso,
+  DEFAULT_TZ,
+} from '../utils/datetime';
+
+export class TelegramWebhookHandler {
+  private telegram: TelegramApi;
+  private taskService: TaskService;
+  private commands: BotCommands;
+  private nlpService: NlpService;
+  private icloudService: ICloudService;
+
+  constructor(private env: Env) {
+    this.telegram = new TelegramApi(env.TELEGRAM_BOT_TOKEN);
+    this.taskService = new TaskService(env.DB);
+    this.commands = new BotCommands(env, this.telegram, this.taskService);
+    this.nlpService = new NlpService(env.GEMINI_API_KEY, env.LLM_MODEL);
+    this.icloudService = new ICloudService(env.ENCRYPTION_SECRET_KEY);
+  }
+
+  async handleUpdate(c: Context<{ Bindings: Env }>): Promise<Response> {
+    // 1. Security Check: Telegram Secret Token
+    const expectedSecret = this.env.TELEGRAM_WEBHOOK_SECRET;
+    if (expectedSecret) {
+      const headerSecret = c.req.header('X-Telegram-Bot-Api-Secret-Token');
+      if (headerSecret !== expectedSecret) {
+        return c.text('Unauthorized', 401);
+      }
+    }
+
+    let update: TelegramUpdate;
+    try {
+      update = await c.req.json<TelegramUpdate>();
+    } catch {
+      return c.text('Invalid JSON', 400);
+    }
+
+    // 2. Handle Message
+    if (update.message) {
+      await this.handleMessage(c, update.message);
+      return c.text('OK', 200);
+    }
+
+    // 3. Handle Callback Query (Inline Keyboard Buttons)
+    if (update.callback_query) {
+      await this.handleCallbackQuery(c, update.callback_query);
+      return c.text('OK', 200);
+    }
+
+    return c.text('OK', 200);
+  }
+
+  private async handleMessage(
+    c: Context<{ Bindings: Env }>,
+    message: NonNullable<TelegramUpdate['message']>
+  ): Promise<void> {
+    const text = message.text?.trim();
+    if (!text) return;
+
+    const chatId = message.chat.id;
+    const userId = message.from?.id || chatId;
+    const username = message.from?.username || null;
+
+    // Check if it is a bot command
+    if (text.startsWith('/')) {
+      await this.commands.handleCommand(message);
+      return;
+    }
+
+    // Ensure user is registered in D1
+    const user = await this.taskService.upsertUser({
+      telegram_id: userId,
+      username,
+    });
+    const tz = user.timezone || DEFAULT_TZ;
+
+    // Call NLP Engine with Gemini Structured Outputs
+    const nlpResult = await this.nlpService.parseUserPrompt(text, tz);
+
+    if (nlpResult.intent === 'LIST_TASKS') {
+      const listCmdMsg = { ...message, text: '/list' };
+      await this.commands.handleCommand(listCmdMsg);
+      return;
+    }
+
+    if (nlpResult.intent === 'CANCEL_TASK') {
+      await this.telegram.sendMessage(
+        chatId,
+        'Để hủy công việc, vui lòng gõ /list và bấm nút "🗑 Hủy" tương ứng.'
+      );
+      return;
+    }
+
+    if (nlpResult.intent === 'CREATE_TASK' && nlpResult.title) {
+      const taskId = crypto.randomUUID();
+
+      let dueAtUtc: string;
+      if (nlpResult.due_at_iso) {
+        try {
+          dueAtUtc = toUtcIso(nlpResult.due_at_iso);
+        } catch {
+          dueAtUtc = addMinutes(new Date(), 30);
+        }
+      } else {
+        dueAtUtc = addMinutes(new Date(), 30);
+      }
+
+      // Calculate remind_at
+      const remindBeforeMin = nlpResult.remind_before_minutes ?? 15;
+      const remindAtUtc =
+        remindBeforeMin > 0
+          ? addMinutes(dueAtUtc, -remindBeforeMin)
+          : dueAtUtc;
+
+      const priority = nlpResult.priority || 'MEDIUM';
+      const nagging = nlpResult.nagging_mode ? 1 : 0;
+
+      // Save to D1
+      const createdTask = await this.taskService.createTask({
+        id: taskId,
+        user_id: userId,
+        title: nlpResult.title,
+        description: nlpResult.description,
+        due_at: dueAtUtc,
+        remind_at: remindAtUtc,
+        priority,
+        nagging_mode: nagging,
+        recurrence_rule: nlpResult.recurrence_rrule,
+      });
+
+      // Background task: sync to iCloud CalDAV if configured
+      if (user.icloud_apple_id && user.icloud_app_password_enc) {
+        c.executionCtx.waitUntil(
+          (async () => {
+            const syncRes = await this.icloudService.syncTaskToCalDav(user, createdTask);
+            if (syncRes.success && syncRes.etag) {
+              await this.taskService.updateTaskCaldavEtag(taskId, syncRes.etag);
+            }
+          })()
+        );
+      }
+
+      // Format confirmation response
+      const priorityLabel =
+        priority === 'CRITICAL' ? '🔴 KHẨN CẤP' :
+        priority === 'HIGH' ? '🟠 CAO' :
+        priority === 'LOW' ? '🟢 THẤP' : '🔵 TRUNG BÌNH';
+
+      let confirmText = `
+✅ *Đã tạo nhắc nhở thành công!*
+
+📌 Tiêu đề: *${createdTask.title}*
+⏰ Hạn chót: *${formatDisplayDate(createdTask.due_at, tz)}*
+🔔 Nhắc lúc: *${formatDisplayDate(createdTask.remind_at, tz)}*
+⚡ Mức độ: *${priorityLabel}*
+      `.trim();
+
+      if (createdTask.recurrence_rule) {
+        confirmText += `\n🔄 Lặp lại: \`${createdTask.recurrence_rule}\``;
+      }
+      if (nagging === 1) {
+        confirmText += `\n⚠️ Chế độ nhắc liên tục (mỗi 10 phút) đã được kích hoạt.`;
+      }
+
+      await this.telegram.sendMessage(chatId, confirmText, {
+        parse_mode: 'Markdown',
+        reply_markup: createTaskCreatedKeyboard(taskId),
+      });
+      return;
+    }
+
+    // Default response if prompt could not be parsed into a task
+    await this.telegram.sendMessage(
+      chatId,
+      `Tôi chưa hiểu rõ yêu cầu nhắc việc của bạn. Hãy thử nhắn rõ thời gian, ví dụ:\n• _"9h sáng mai họp với phòng kinh doanh"_\n• _"Nhắc tôi uống thuốc sau 15 phút nữa, việc gấp"_`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  private async handleCallbackQuery(
+    c: Context<{ Bindings: Env }>,
+    query: NonNullable<TelegramUpdate['callback_query']>
+  ): Promise<void> {
+    const data = query.data;
+    if (!data) return;
+
+    const chatId = query.message?.chat.id || query.from.id;
+    const messageId = query.message?.message_id;
+    const parts = data.split(':');
+    const [action, subAction, paramId] = parts;
+
+    if (action !== 'action') return;
+
+    const user = await this.taskService.getUser(query.from.id);
+    const tz = user?.timezone || DEFAULT_TZ;
+
+    if (subAction === 'done') {
+      const taskId = paramId;
+      const task = await this.taskService.getTaskById(taskId);
+
+      if (!task) {
+        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
+        return;
+      }
+
+      if (task.recurrence_rule) {
+        // Calculate next recurrence for recurring tasks
+        const next = calculateNextRecurrence(task.due_at, task.remind_at, task.recurrence_rule);
+        await this.taskService.completeTask(taskId, next);
+
+        if (messageId) {
+          const editMsg = `✅ *Đã hoàn thành lần này!*\n📌 ${task.title}\n⏰ Lần nhắc kế tiếp: *${formatDisplayDate(next.remindAt, tz)}*`;
+          await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
+        }
+      } else {
+        await this.taskService.completeTask(taskId);
+
+        // Sync to iCloud in background
+        if (user && user.icloud_apple_id) {
+          c.executionCtx.waitUntil(
+            this.icloudService.syncTaskToCalDav(user, task, 'COMPLETED')
+          );
+        }
+
+        if (messageId) {
+          const editMsg = `✅ *Đã hoàn thành:* ${task.title} (lúc ${formatDisplayDate(new Date().toISOString(), tz)})`;
+          await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
+        }
+      }
+
+      await this.telegram.answerCallbackQuery(query.id, 'Đã ghi nhận hoàn thành!');
+      return;
+    }
+
+    if (subAction === 'snooze') {
+      // Format: action:snooze:{minutes|tomorrow}:{taskId}
+      const snoozeArg = paramId;
+      const taskId = parts[3];
+      const task = await this.taskService.getTaskById(taskId);
+
+      if (!task) {
+        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
+        return;
+      }
+
+      let newRemindAt: string;
+      let snoozeNote: string;
+
+      if (snoozeArg === 'tomorrow') {
+        newRemindAt = getTomorrowMorningIso(tz, 9, 0);
+        snoozeNote = 'đến 09:00 sáng mai';
+      } else {
+        const mins = parseInt(snoozeArg, 10) || 15;
+        newRemindAt = addMinutes(new Date(), mins);
+        snoozeNote = `thêm ${mins} phút`;
+      }
+
+      await this.taskService.snoozeTask(taskId, newRemindAt);
+
+      if (messageId) {
+        const editMsg = `💤 *Đã hoãn nhắc nhở ${snoozeNote}*\n📌 *${task.title}*\n⏰ Sẽ nhắc lại vào: *${formatDisplayDate(newRemindAt, tz)}*`;
+        await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
+      }
+
+      await this.telegram.answerCallbackQuery(query.id, `Đã hoãn ${snoozeNote}`);
+      return;
+    }
+
+    if (subAction === 'cancel') {
+      const taskId = paramId;
+      const task = await this.taskService.getTaskById(taskId);
+
+      if (!task) {
+        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
+        return;
+      }
+
+      await this.taskService.cancelTask(taskId);
+
+      // Delete from iCloud in background
+      if (user && user.icloud_apple_id) {
+        c.executionCtx.waitUntil(this.icloudService.deleteTaskFromCalDav(user, taskId));
+      }
+
+      if (messageId) {
+        const editMsg = `🗑 *Đã hủy nhắc việc:* ~${task.title}~`;
+        await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
+      }
+
+      await this.telegram.answerCallbackQuery(query.id, 'Đã hủy công việc!');
+      return;
+    }
+  }
+}
