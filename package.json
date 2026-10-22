@@ -4,6 +4,7 @@
   "description": "Telegram Smart Reminder Bot with Cloudflare Workers, D1, Gemini AI and iOS Reminders sync",
   "main": "src/index.ts",
   "type": "module",
+  "packageManager": "pnpm@9.12.3",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
