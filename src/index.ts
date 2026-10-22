@@ -4,8 +4,25 @@ import { TelegramWebhookHandler } from './bot/webhook';
 import { TelegramApi } from './bot/telegram';
 import { NotifierService } from './services/notifier.service';
 import { TaskService } from './services/task.service';
+import {
+  calculateNextRecurrence,
+  escapeMarkdown,
+  formatDisplayDate,
+  DEFAULT_TZ,
+} from './utils/datetime';
 
 const app = new Hono<{ Bindings: Env }>();
+
+// Middleware for Admin / Diagnostic endpoints
+const requireAdminAuth = async (c: Context<{ Bindings: Env }>, next: Next) => {
+  const secretKey = c.req.header('X-Admin-Key');
+  const expectedKey = c.env.ENCRYPTION_SECRET_KEY || c.env.TELEGRAM_WEBHOOK_SECRET;
+
+  if (!expectedKey || !secretKey || secretKey !== expectedKey) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  await next();
+};
 
 // Healthcheck
 app.get('/', (c) => c.text('Telegram Smart Reminder Bot is running on Cloudflare Workers! 🚀'));
@@ -18,13 +35,15 @@ app.post('/webhook/telegram', async (c) => {
 });
 
 // Setup Telegram Webhook utility
-app.post('/api/setup-webhook', async (c) => {
-  const secretKey = c.req.header('X-Admin-Key');
-  if (c.env.ENCRYPTION_SECRET_KEY && secretKey !== c.env.ENCRYPTION_SECRET_KEY) {
-    return c.text('Unauthorized', 401);
+app.post('/api/setup-webhook', requireAdminAuth, async (c) => {
+  let body: { webhook_url?: string };
+  try {
+    body = await c.req.json<{ webhook_url?: string }>();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
   }
 
-  const { webhook_url } = await c.req.json<{ webhook_url?: string }>();
+  const { webhook_url } = body;
   if (!webhook_url) {
     return c.json({ error: 'Missing webhook_url' }, 400);
   }
@@ -38,8 +57,9 @@ app.post('/api/setup-webhook', async (c) => {
     error_code: result.error_code,
   });
 });
+
 // Diagnostic endpoint to check Telegram status and Database health
-app.get('/api/webhook-info', async (c) => {
+app.get('/api/webhook-info', requireAdminAuth, async (c) => {
   if (!c.env.TELEGRAM_BOT_TOKEN) {
     return c.json({ error: 'TELEGRAM_BOT_TOKEN is not configured in Worker secrets.' }, 500);
   }
@@ -76,9 +96,17 @@ app.get('/api/webhook-info', async (c) => {
     return c.json({ error: err instanceof Error ? err.message : String(err) }, 500);
   }
 });
+
 // Test sending a message from Worker to verify bot token and reachability
-app.post('/api/test-message', async (c) => {
-  const { chat_id, text } = await c.req.json<{ chat_id?: number | string; text?: string }>();
+app.post('/api/test-message', requireAdminAuth, async (c) => {
+  let body: { chat_id?: number | string; text?: string };
+  try {
+    body = await c.req.json<{ chat_id?: number | string; text?: string }>();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const { chat_id, text } = body;
   if (!chat_id) {
     return c.json({ error: 'Missing chat_id in JSON body' }, 400);
   }
@@ -88,12 +116,7 @@ app.post('/api/test-message', async (c) => {
 });
 
 // Quick endpoint to apply D1 schema migration directly
-app.post('/api/migrate', async (c) => {
-  const secretKey = c.req.header('X-Admin-Key');
-  if (c.env.ENCRYPTION_SECRET_KEY && secretKey !== c.env.ENCRYPTION_SECRET_KEY) {
-    return c.text('Unauthorized', 401);
-  }
-
+app.post('/api/migrate', requireAdminAuth, async (c) => {
   const schema = `
     CREATE TABLE IF NOT EXISTS users (
         telegram_id INTEGER PRIMARY KEY,
@@ -146,29 +169,41 @@ const authIosBridge = async (c: Context<{ Bindings: Env }>, next: Next) => {
   const authHeader = c.req.header('Authorization');
   const expectedSecret = c.env.IOS_BRIDGE_SECRET || c.env.ENCRYPTION_SECRET_KEY;
 
-  if (expectedSecret) {
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return c.json({ error: 'Missing or invalid Authorization header' }, 401);
-    }
-    const token = authHeader.replace(/^Bearer\s+/, '');
-    if (token !== expectedSecret) {
-      return c.json({ error: 'Unauthorized' }, 401);
-    }
+  if (!expectedSecret) {
+    return c.json({ error: 'iOS Bridge secret is not configured on server' }, 500);
   }
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Missing or invalid Authorization header' }, 401);
+  }
+
+  const token = authHeader.replace(/^Bearer\s+/, '');
+  if (token !== expectedSecret) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
   await next();
 };
 
 /**
  * GET /api/ios/unsynced
  * Returns tasks pending to be added to iOS Reminders via iOS Shortcut.
+ * Supports optional ?user_id=<telegram_id> query parameter to isolate multi-user data.
  */
 app.get('/api/ios/unsynced', authIosBridge, async (c) => {
+  const userIdQuery = c.req.query('user_id');
+  const parsedUserId = userIdQuery ? parseInt(userIdQuery, 10) : undefined;
+  if (userIdQuery && Number.isNaN(parsedUserId)) {
+    return c.json({ error: 'Invalid user_id query parameter' }, 400);
+  }
+
   const taskService = new TaskService(c.env.DB);
-  const unsynced = await taskService.getUnsyncedIosTasks(50);
+  const unsynced = await taskService.getUnsyncedIosTasks(50, parsedUserId);
   return c.json({
     count: unsynced.length,
     tasks: unsynced.map((t) => ({
       id: t.id,
+      user_id: t.user_id,
       title: t.title,
       description: t.description,
       due_at: t.due_at,
@@ -182,15 +217,20 @@ app.get('/api/ios/unsynced', authIosBridge, async (c) => {
  * Marks tasks as synced once created in iOS Reminders.
  */
 app.post('/api/ios/synced', authIosBridge, async (c) => {
-  const { task_ids } = await c.req.json<{ task_ids?: string[] }>();
+  let body: { task_ids?: string[] };
+  try {
+    body = await c.req.json<{ task_ids?: string[] }>();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const { task_ids } = body;
   if (!task_ids || !Array.isArray(task_ids)) {
     return c.json({ error: 'Missing task_ids array' }, 400);
   }
 
   const taskService = new TaskService(c.env.DB);
-  for (const id of task_ids) {
-    await taskService.markTaskIosSynced(id, 1);
-  }
+  await taskService.batchMarkTasksIosSynced(task_ids, 1);
 
   return c.json({ success: true, synced_count: task_ids.length });
 });
@@ -200,9 +240,19 @@ app.post('/api/ios/synced', authIosBridge, async (c) => {
  * Receives completion events from iOS Shortcut when user marks a reminder done on iPhone.
  */
 app.post('/api/ios/webhook', authIosBridge, async (c) => {
-  const body = await c.req.json<{ task_id: string; action: 'COMPLETED' | 'CANCELLED' }>();
+  let body: { task_id?: string; action?: 'COMPLETED' | 'CANCELLED' };
+  try {
+    body = await c.req.json<{ task_id?: string; action?: 'COMPLETED' | 'CANCELLED' }>();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
   if (!body.task_id) {
     return c.json({ error: 'Missing task_id' }, 400);
+  }
+
+  if (body.action !== 'COMPLETED' && body.action !== 'CANCELLED') {
+    return c.json({ error: 'Invalid action. Expected COMPLETED or CANCELLED' }, 400);
   }
 
   const taskService = new TaskService(c.env.DB);
@@ -212,16 +262,33 @@ app.post('/api/ios/webhook', authIosBridge, async (c) => {
     return c.json({ error: 'Task not found' }, 404);
   }
 
-  if (body.action === 'COMPLETED') {
-    await taskService.completeTask(body.task_id);
+  const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
+  const safeTitle = escapeMarkdown(task.title);
 
-    // Notify user on Telegram
-    const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
-    await telegram.sendMessage(
-      task.user_id,
-      `📱✅ *Đã đánh dấu hoàn thành từ iPhone Reminders:*\n📌 ${task.title}`,
-      { parse_mode: 'Markdown' }
-    );
+  if (body.action === 'COMPLETED') {
+    if (task.recurrence_rule) {
+      const user = await taskService.getUser(task.user_id);
+      const tz = user?.timezone || DEFAULT_TZ;
+      const next = calculateNextRecurrence(task.due_at, task.remind_at, task.recurrence_rule, tz);
+      await taskService.completeTask(body.task_id, next);
+
+      await telegram.sendMessage(
+        task.user_id,
+        `📱✅ *Đã hoàn thành chu kỳ hiện tại từ iPhone Reminders:*\n📌 ${safeTitle}\n⏰ Lần nhắc tiếp theo: *${formatDisplayDate(
+          next.remindAt,
+          tz
+        )}*`,
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      await taskService.completeTask(body.task_id);
+
+      await telegram.sendMessage(
+        task.user_id,
+        `📱✅ *Đã đánh dấu hoàn thành từ iPhone Reminders:*\n📌 ${safeTitle}`,
+        { parse_mode: 'Markdown' }
+      );
+    }
   } else if (body.action === 'CANCELLED') {
     await taskService.cancelTask(body.task_id);
   }

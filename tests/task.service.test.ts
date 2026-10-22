@@ -18,7 +18,7 @@ describe('TaskService', () => {
           run: vi.fn().mockResolvedValue({ success: true }),
         }),
       }),
-    } as unknown as D1Database; // Mock D1 for unit testing
+    } as unknown as D1Database;
 
     const taskService = new TaskService(mockDb);
     const user = await taskService.upsertUser({
@@ -52,7 +52,7 @@ describe('TaskService', () => {
           run: vi.fn().mockResolvedValue({ success: true }),
         }),
       }),
-    } as unknown as D1Database; // Mock D1 for unit testing
+    } as unknown as D1Database;
 
     const taskService = new TaskService(mockDb);
     const created = await taskService.createTask(sampleTask);
@@ -71,7 +71,7 @@ describe('TaskService', () => {
     const mockDb = {
       prepare: prepareMock,
       batch: batchMock,
-    } as unknown as D1Database; // Mock D1 for unit testing
+    } as unknown as D1Database;
 
     const taskService = new TaskService(mockDb);
     await taskService.batchUpdateRemindAt([
@@ -81,5 +81,58 @@ describe('TaskService', () => {
 
     expect(prepareMock).toHaveBeenCalledTimes(2);
     expect(batchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('scopes getUnsyncedIosTasks by userId when provided', async () => {
+    const bindMock = vi.fn().mockReturnValue({
+      all: vi.fn().mockResolvedValue({ results: [] }),
+    });
+    const prepareMock = vi.fn().mockReturnValue({
+      bind: bindMock,
+    });
+
+    const mockDb = {
+      prepare: prepareMock,
+    } as unknown as D1Database;
+
+    const taskService = new TaskService(mockDb);
+    await taskService.getUnsyncedIosTasks(50, 999888);
+
+    expect(prepareMock).toHaveBeenCalledWith(expect.stringContaining('AND user_id = ?'));
+    expect(bindMock).toHaveBeenCalledWith(999888, 50);
+  });
+
+  it('updates due_at when snoozing past original due_at', async () => {
+    const existingTask: TaskRecord = {
+      id: 'task-snooze-1',
+      user_id: 123,
+      title: 'Báo cáo',
+      due_at: '2026-10-22T08:00:00.000Z',
+      remind_at: '2026-10-22T08:00:00.000Z',
+      priority: 'MEDIUM',
+      status: 'PENDING',
+      nagging_mode: 0,
+      snooze_count: 0,
+      ios_synced: 0,
+    };
+
+    const bindMock = vi.fn().mockReturnValue({
+      first: vi.fn().mockResolvedValue(existingTask),
+      run: vi.fn().mockResolvedValue({ success: true }),
+    });
+    const prepareMock = vi.fn().mockReturnValue({
+      bind: bindMock,
+    });
+
+    const mockDb = {
+      prepare: prepareMock,
+    } as unknown as D1Database;
+
+    const taskService = new TaskService(mockDb);
+    const tomorrowRemind = '2026-10-23T02:00:00.000Z';
+    await taskService.snoozeTask('task-snooze-1', tomorrowRemind);
+
+    expect(prepareMock).toHaveBeenCalledWith(expect.stringContaining('SET remind_at = ?,\n            due_at = ?'));
+    expect(bindMock).toHaveBeenCalledWith(tomorrowRemind, tomorrowRemind, 'task-snooze-1');
   });
 });

@@ -130,6 +130,7 @@ export class TaskService {
     }
     return fetched;
   }
+
   async getTaskById(taskId: string): Promise<TaskRecord | null> {
     const query = `SELECT * FROM tasks WHERE id = ? LIMIT 1;`;
     const result = await this.db.prepare(query).bind(taskId).first<TaskRecord>();
@@ -177,6 +178,7 @@ export class TaskService {
 
   /**
    * Fetches today's tasks for a user based on user's timezone.
+   * Includes tasks whose due_at OR remind_at falls within today's window.
    */
   async getTodayTasks(userId: number, timezone = DEFAULT_TZ): Promise<TaskRecord[]> {
     const { startUtc, endUtc } = getDayRangeUtc(new Date(), timezone);
@@ -185,11 +187,16 @@ export class TaskService {
       SELECT * FROM tasks
       WHERE user_id = ?
         AND status = 'PENDING'
-        AND due_at >= ?
-        AND due_at <= ?
+        AND (
+          (due_at >= ? AND due_at <= ?)
+          OR (remind_at >= ? AND remind_at <= ?)
+        )
       ORDER BY due_at ASC;
     `;
-    const { results } = await this.db.prepare(query).bind(userId, startUtc, endUtc).all<TaskRecord>();
+    const { results } = await this.db
+      .prepare(query)
+      .bind(userId, startUtc, endUtc, startUtc, endUtc)
+      .all<TaskRecord>();
     return results || [];
   }
 
@@ -207,6 +214,7 @@ export class TaskService {
             remind_at = ?,
             status = 'PENDING',
             snooze_count = 0,
+            ios_synced = 0,
             updated_at = datetime('now')
         WHERE id = ?;
       `;
@@ -228,17 +236,37 @@ export class TaskService {
   }
 
   /**
-   * Snoozes a task by updating its remind_at and incrementing snooze_count.
+   * Snoozes a task by updating its remind_at, incrementing snooze_count,
+   * and advancing due_at if newRemindAt exceeds the current due_at.
    */
   async snoozeTask(taskId: string, newRemindAt: string): Promise<TaskRecord | null> {
-    const query = `
-      UPDATE tasks
-      SET remind_at = ?,
-          snooze_count = snooze_count + 1,
-          updated_at = datetime('now')
-      WHERE id = ?;
-    `;
-    await this.db.prepare(query).bind(newRemindAt, taskId).run();
+    const existing = await this.getTaskById(taskId);
+    let updatedDueAt = existing?.due_at;
+    if (existing && new Date(newRemindAt).getTime() > new Date(existing.due_at).getTime()) {
+      updatedDueAt = newRemindAt;
+    }
+
+    if (updatedDueAt && existing && updatedDueAt !== existing.due_at) {
+      const query = `
+        UPDATE tasks
+        SET remind_at = ?,
+            due_at = ?,
+            snooze_count = snooze_count + 1,
+            updated_at = datetime('now')
+        WHERE id = ?;
+      `;
+      await this.db.prepare(query).bind(newRemindAt, updatedDueAt, taskId).run();
+    } else {
+      const query = `
+        UPDATE tasks
+        SET remind_at = ?,
+            snooze_count = snooze_count + 1,
+            updated_at = datetime('now')
+        WHERE id = ?;
+      `;
+      await this.db.prepare(query).bind(newRemindAt, taskId).run();
+    }
+
     return this.getTaskById(taskId);
   }
 
@@ -281,9 +309,22 @@ export class TaskService {
   }
 
   /**
-   * Gets unsynced tasks for iOS Shortcuts Bridge (Adapter B).
+   * Gets unsynced tasks for iOS Shortcuts Bridge (Adapter B), optionally scoped to a specific user_id.
    */
-  async getUnsyncedIosTasks(limit = 20): Promise<TaskRecord[]> {
+  async getUnsyncedIosTasks(limit = 20, userId?: number): Promise<TaskRecord[]> {
+    if (userId !== undefined && !Number.isNaN(userId)) {
+      const query = `
+        SELECT * FROM tasks
+        WHERE ios_synced = 0
+          AND status = 'PENDING'
+          AND user_id = ?
+        ORDER BY created_at ASC
+        LIMIT ?;
+      `;
+      const { results } = await this.db.prepare(query).bind(userId, limit).all<TaskRecord>();
+      return results || [];
+    }
+
     const query = `
       SELECT * FROM tasks
       WHERE ios_synced = 0
@@ -304,9 +345,22 @@ export class TaskService {
   }
 
   /**
+   * Batch marks multiple tasks as synced with iOS in a single D1 round-trip.
+   */
+  async batchMarkTasksIosSynced(taskIds: string[], synced = 1): Promise<void> {
+    if (taskIds.length === 0) return;
+    const statements = taskIds.map((id) =>
+      this.db
+        .prepare(`UPDATE tasks SET ios_synced = ?, updated_at = datetime('now') WHERE id = ?;`)
+        .bind(synced, id)
+    );
+    await this.db.batch(statements);
+  }
+
+  /**
    * Updates CalDAV ETag after syncing with iCloud.
    */
-  async updateTaskCaldavEtag(taskId: string, etag: string): Promise<void> {
+  async updateTaskCaldavEtag(taskId: string, etag: string | null): Promise<void> {
     const query = `
       UPDATE tasks
       SET caldav_etag = ?,

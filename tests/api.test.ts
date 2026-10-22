@@ -6,8 +6,34 @@ function createMockD1(): D1Database {
   const mockStatement = {
     bind: (..._params: unknown[]) => mockStatement,
     first: async <T>() => null as T | null,
-    all: async <T>() => ({ results: [] as T[], success: true, meta: { served_by: 'mock', duration: 0, changes: 0, last_row_id: 0, changed_db: false, size_after: 0, rows_read: 0, rows_written: 0 } }),
-    run: async () => ({ results: [], success: true, meta: { served_by: 'mock', duration: 0, changes: 1, last_row_id: 0, changed_db: false, size_after: 0, rows_read: 0, rows_written: 0 } }),
+    all: async <T>() => ({
+      results: [] as T[],
+      success: true,
+      meta: {
+        served_by: 'mock',
+        duration: 0,
+        changes: 0,
+        last_row_id: 0,
+        changed_db: false,
+        size_after: 0,
+        rows_read: 0,
+        rows_written: 0,
+      },
+    }),
+    run: async () => ({
+      results: [],
+      success: true,
+      meta: {
+        served_by: 'mock',
+        duration: 0,
+        changes: 1,
+        last_row_id: 0,
+        changed_db: false,
+        size_after: 0,
+        rows_read: 0,
+        rows_written: 0,
+      },
+    }),
     raw: async () => [],
   };
 
@@ -18,7 +44,7 @@ function createMockD1(): D1Database {
     dump: async () => new ArrayBuffer(0),
   };
 
-  return mockDb as unknown as D1Database; // Mock D1 database interface for unit testing
+  return mockDb as unknown as D1Database;
 }
 
 describe('Hono API Routes', () => {
@@ -26,6 +52,7 @@ describe('Hono API Routes', () => {
     DB: createMockD1(),
     TELEGRAM_BOT_TOKEN: 'mock_token',
     TELEGRAM_WEBHOOK_SECRET: 'super_secret',
+    ENCRYPTION_SECRET_KEY: 'admin_encryption_secret',
     IOS_BRIDGE_SECRET: 'ios_bearer_token',
   };
 
@@ -58,14 +85,43 @@ describe('Hono API Routes', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects unauthenticated access to /api/test-message and /api/webhook-info', async () => {
+    const testMsgRes = await app.fetch(
+      new Request('http://localhost/api/test-message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: 123, text: 'hello' }),
+      }),
+      env
+    );
+    expect(testMsgRes.status).toBe(401);
+
+    const infoRes = await app.fetch(new Request('http://localhost/api/webhook-info'), env);
+    expect(infoRes.status).toBe(401);
+  });
+
   it('rejects /api/ios/unsynced without Bearer token', async () => {
     const res = await app.fetch(new Request('http://localhost/api/ios/unsynced'), env);
     expect(res.status).toBe(401);
   });
 
-  it('allows /api/ios/unsynced with valid Bearer token', async () => {
+  it('rejects /api/ios/unsynced with 500 when no server secret is configured', async () => {
+    const unconfiguredEnv: Env = {
+      DB: createMockD1(),
+      TELEGRAM_BOT_TOKEN: 'mock_token',
+    };
     const res = await app.fetch(
       new Request('http://localhost/api/ios/unsynced', {
+        headers: { Authorization: 'Bearer anything' },
+      }),
+      unconfiguredEnv
+    );
+    expect(res.status).toBe(500);
+  });
+
+  it('allows /api/ios/unsynced with valid Bearer token and optional user_id filter', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/api/ios/unsynced?user_id=123456', {
         headers: {
           Authorization: 'Bearer ios_bearer_token',
         },
@@ -76,5 +132,20 @@ describe('Hono API Routes', () => {
     const body = (await res.json()) as { count: number; tasks: unknown[] };
     expect(body.count).toBe(0);
     expect(body.tasks).toEqual([]);
+  });
+
+  it('returns 400 on malformed JSON body in /api/ios/synced', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/api/ios/synced', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ios_bearer_token',
+          'Content-Type': 'application/json',
+        },
+        body: '{malformed_json',
+      }),
+      env
+    );
+    expect(res.status).toBe(400);
   });
 });

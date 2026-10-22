@@ -35,6 +35,24 @@ export class TelegramApi {
       if (!res.ok) {
         const errorText = await res.text();
         console.error(`Telegram sendMessage failed (${res.status}): ${errorText}`);
+
+        // Fallback: if Markdown parsing failed (HTTP 400), retry once as plain text
+        if (res.status === 400 && options?.parse_mode) {
+          const retryRes = await fetch(`${this.baseUrl}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              text,
+              reply_markup: options?.reply_markup,
+              reply_to_message_id: options?.reply_to_message_id,
+            }),
+          });
+          if (retryRes.ok) {
+            const retryData = (await retryRes.json()) as { ok: boolean; result: TelegramMessage };
+            return retryData.result;
+          }
+        }
         return null;
       }
 
@@ -71,6 +89,20 @@ export class TelegramApi {
       if (!res.ok) {
         const err = await res.text();
         console.error(`Telegram editMessageText failed: ${err}`);
+
+        if (res.status === 400 && options?.parse_mode) {
+          const retryRes = await fetch(`${this.baseUrl}/editMessageText`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId,
+              text,
+              reply_markup: options?.reply_markup,
+            }),
+          });
+          return retryRes.ok;
+        }
         return false;
       }
       return true;
@@ -101,6 +133,7 @@ export class TelegramApi {
       return false;
     }
   }
+
   async sendChatAction(chatId: number | string, action: 'typing' = 'typing'): Promise<boolean> {
     try {
       const res = await fetch(`${this.baseUrl}/sendChatAction`, {
@@ -113,7 +146,6 @@ export class TelegramApi {
       return false;
     }
   }
-
 
   async setWebhook(
     url: string,

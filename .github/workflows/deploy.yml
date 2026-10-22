@@ -72,7 +72,6 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: d1 execute reminder_bot_db --remote --file=./migrations/0001_init_schema.sql
-        continue-on-error: true # Continues if DB/tables are already initialized
 
       - name: Deploy Worker
         uses: cloudflare/wrangler-action@v3

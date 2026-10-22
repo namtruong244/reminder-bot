@@ -9,6 +9,13 @@ describe('NlpService', () => {
     expect(result.intent).toBe('LIST_TASKS');
   });
 
+  it('does NOT misclassify task containing the phrase "danh sách" as LIST_TASKS', async () => {
+    const result = await service.parseUserPrompt('Nhắc tôi 3h chiều mai gửi danh sách khách hàng cho sếp');
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toContain('gửi danh sách khách hàng cho sếp');
+    expect(result.due_at_iso).toContain('T15:00:00+07:00');
+  });
+
   it('extracts task with minutes delay and critical priority heuristic', async () => {
     const result = await service.parseUserPrompt('Nhắc tôi gọi điện cho sếp sau 15 phút, việc gấp');
     expect(result.intent).toBe('CREATE_TASK');
@@ -40,8 +47,6 @@ describe('NlpService', () => {
     expect(result.due_at_iso).toContain('T16:30:00+07:00');
   });
 
-  // ========== TEST CASES FOR REPORTED ISSUES ==========
-
   it('extracts "trưa mai làm..." correctly', async () => {
     const result = await service.parseUserPrompt('trưa mai làm báo cáo tài chính');
     expect(result.intent).toBe('CREATE_TASK');
@@ -50,7 +55,6 @@ describe('NlpService', () => {
     expect(result.due_at_iso).toContain('T12:00:00+07:00');
     expect(result.remind_before_minutes).toBe(0);
 
-    // Verify it is tomorrow's date
     const now = new Date();
     const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
     const expectedYear = tomorrow.getFullYear();
@@ -65,7 +69,6 @@ describe('NlpService', () => {
     expect(result.due_at_iso).toBeDefined();
     expect(result.due_at_iso).toContain('-04T09:00:00+07:00');
 
-    // Ensure due_at_iso is in the future
     const dueDate = new Date(result.due_at_iso!);
     expect(dueDate.getTime()).toBeGreaterThan(Date.now());
   });
@@ -105,5 +108,21 @@ describe('NlpService', () => {
     expect(result.title).toBe('họp giao ban');
     expect(result.recurrence_rrule).toBe('FREQ=WEEKLY;BYDAY=MO');
     expect(result.due_at_iso).toContain('T09:00:00+07:00');
+  });
+
+  it('extracts explicit remind_before_minutes when user specifies "nhắc trước 30 phút"', async () => {
+    const result = await service.parseUserPrompt('9h sáng mai họp khách hàng, nhắc trước 30 phút');
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('họp khách hàng');
+    expect(result.remind_before_minutes).toBe(30);
+    expect(result.due_at_iso).toContain('T09:00:00+07:00');
+  });
+
+  it('extracts standalone weekday "Chiều thứ 6 lúc 17h đón con ở trường, việc gấp"', async () => {
+    const result = await service.parseUserPrompt('Chiều thứ 6 lúc 17h đón con ở trường, việc gấp');
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.priority).toBe('CRITICAL');
+    expect(result.title).toBe('đón con ở trường');
+    expect(result.due_at_iso).toContain('T17:00:00+07:00');
   });
 });

@@ -5,12 +5,14 @@ import {
   toUtcIso,
   toCompactUtcString,
   addMinutes,
-  addDays,
   calculateNextRecurrence,
   getNowWithTimezone,
   getVietnameseDayOfWeek,
   getDayRangeUtc,
+  escapeMarkdown,
+  getDaysInMonth,
 } from '../src/utils/datetime';
+import { ICloudCalDavService } from '../src/services/icloud.service';
 
 describe('Crypto Utils', () => {
   const secretKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -35,7 +37,7 @@ describe('Crypto Utils', () => {
   });
 });
 
-describe('Datetime Utils', () => {
+describe('Datetime & Markdown Utils', () => {
   it('converts Vietnam local ISO to UTC ISO', () => {
     const vnTime = '2026-10-22T15:00:00+07:00';
     const utcIso = toUtcIso(vnTime);
@@ -46,6 +48,12 @@ describe('Datetime Utils', () => {
     const utcIso = '2026-10-22T08:00:00.000Z';
     const display = formatDisplayDate(utcIso, 'Asia/Ho_Chi_Minh');
     expect(display).toBe('15:00 - 22/10/2026');
+  });
+
+  it('formats midnight as 00:xx instead of 24:xx', () => {
+    const midnightVnUtc = new Date('2026-10-21T17:05:00.000Z'); // 00:05 on 2026-10-22 in VN
+    const iso = getNowWithTimezone(midnightVnUtc, 'Asia/Ho_Chi_Minh');
+    expect(iso).toBe('2026-10-22T00:05:00+07:00');
   });
 
   it('formats compact UTC string for iCalendar', () => {
@@ -63,7 +71,7 @@ describe('Datetime Utils', () => {
   it('calculates next recurrence for daily rule', () => {
     const dueAt = new Date(Date.now() + 3600000).toISOString();
     const remindAt = new Date(Date.now() + 3600000 - 15 * 60000).toISOString();
-    const { dueAt: nextDue, remindAt: nextRemind } = calculateNextRecurrence(dueAt, remindAt, 'FREQ=DAILY;INTERVAL=1');
+    const { dueAt: nextDue } = calculateNextRecurrence(dueAt, remindAt, 'FREQ=DAILY;INTERVAL=1');
 
     const nextDueDate = new Date(nextDue);
     const prevDueDate = new Date(dueAt);
@@ -82,16 +90,56 @@ describe('Datetime Utils', () => {
     const { dueAt: nextDue } = calculateNextRecurrence(dueAt, remindAt, 'FREQ=MONTHLY;BYMONTHDAY=4');
     const nextDate = new Date(nextDue);
     expect(nextDate.getUTCDate()).toBe(4);
-    // Should be in the future
     expect(nextDate.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('clamps month-end recurrence without skipping February (Jan 31 -> Feb 28)', () => {
+    const futureYear = new Date().getUTCFullYear() + 1;
+    const dueAt = `${futureYear}-01-31T02:00:00.000Z`; // Jan 31 09:00 VN
+    const remindAt = `${futureYear}-01-31T02:00:00.000Z`;
+    const { dueAt: nextDue } = calculateNextRecurrence(
+      dueAt,
+      remindAt,
+      'FREQ=MONTHLY;BYMONTHDAY=31',
+      'Asia/Ho_Chi_Minh'
+    );
+    const expectedFebDays = getDaysInMonth(futureYear, 2);
+    expect(nextDue).toBe(`${futureYear}-02-${expectedFebDays}T02:00:00.000Z`);
   });
 
   it('calculates getDayRangeUtc correctly in Asia/Ho_Chi_Minh', () => {
     const date = new Date('2026-10-22T03:00:00.000Z'); // 10:00 AM VN on Oct 22
     const { startUtc, endUtc } = getDayRangeUtc(date, 'Asia/Ho_Chi_Minh');
-    // Start of Oct 22 in VN is Oct 21 17:00:00 UTC
     expect(startUtc).toBe('2026-10-21T17:00:00.000Z');
-    // End of Oct 22 in VN is Oct 22 16:59:59.999 UTC
     expect(endUtc).toBe('2026-10-22T16:59:59.999Z');
+  });
+
+  it('escapes special Telegram Markdown characters safely', () => {
+    const raw = 'Review file_v1_final *urgent* `code` [link]';
+    const escaped = escapeMarkdown(raw);
+    expect(escaped).toBe('Review file\\_v1\\_final \\*urgent\\* \\`code\\` \\[link]');
+  });
+
+  it('builds valid CalDAV VTODO ICS payload', () => {
+    const caldav = new ICloudCalDavService();
+    const ics = caldav.buildVTodoIcs({
+      id: 'uuid-test-1',
+      user_id: 100,
+      title: 'Gửi hợp đồng',
+      description: 'Khách VIP',
+      due_at: '2026-10-22T08:00:00.000Z',
+      remind_at: '2026-10-22T07:45:00.000Z',
+      priority: 'CRITICAL',
+      status: 'PENDING',
+      recurrence_rule: 'FREQ=DAILY',
+      nagging_mode: 1,
+      snooze_count: 0,
+      ios_synced: 0,
+    });
+    expect(ics).toContain('BEGIN:VTODO');
+    expect(ics).toContain('UID:uuid-test-1');
+    expect(ics).toContain('DUE:20261022T080000Z');
+    expect(ics).toContain('PRIORITY:1');
+    expect(ics).toContain('RRULE:FREQ=DAILY');
   });
 });

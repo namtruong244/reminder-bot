@@ -2,7 +2,7 @@ import { Env } from '../types/env';
 import { TelegramMessage } from '../types/task';
 import { TelegramApi } from './telegram';
 import { TaskService } from '../services/task.service';
-import { formatDisplayDate, DEFAULT_TZ } from '../utils/datetime';
+import { formatDisplayDate, escapeMarkdown, DEFAULT_TZ } from '../utils/datetime';
 import { createTaskListKeyboard } from './keyboards';
 
 export class BotCommands {
@@ -78,7 +78,7 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
     const help = `
 📖 *HƯỚNG DẪN SỬ DỤNG*
 
-1️⃣ *Tạo nhắc nhở:* Bạn có thể nhắn tin thoại hoặc tin nhắn văn bản tự nhiên:
+1️⃣ *Tạo nhắc nhở:* Nhắn tin văn bản tự nhiên bằng tiếng Việt:
 • _"9h sáng mai họp team marketing"_
 • _"Nhắc tôi uống nước sau 30 phút nữa"_
 • _"Chiều thứ 6 lúc 17h đón con ở trường, việc gấp"_
@@ -91,7 +91,7 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
 • /timezone <múi_giờ>: Đổi múi giờ (mặc định: \`Asia/Ho_Chi_Minh\`)
 
 3️⃣ *Đồng bộ iOS Reminders:*
-• Các task tạo trên Telegram sẽ tự động sẵn sàng để đồng bộ về app Lời nhắc của iPhone thông qua Phím tắt (Shortcuts).
+• Các task tạo trên Telegram sẽ tự động đồng bộ qua iCloud CalDAV (nếu đã cấu hình) hoặc sẵn sàng kéo về app Lời nhắc của iPhone thông qua Phím tắt (Shortcuts).
 • Dùng lệnh /sync để xem số lượng task đang chờ kéo về iPhone.
     `.trim();
     await this.telegram.sendMessage(chatId, help, { parse_mode: 'Markdown' });
@@ -100,7 +100,7 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
   private async handleList(chatId: number, userId: number): Promise<void> {
     const user = await this.taskService.getUser(userId);
     const timezone = user?.timezone || DEFAULT_TZ;
-    const tasks = await this.taskService.getTasksByUser(userId, 'PENDING', 10);
+    const tasks = await this.taskService.getTasksByUser(userId, 'PENDING', 20);
 
     if (tasks.length === 0) {
       await this.telegram.sendMessage(chatId, '🎉 Bạn không có công việc nào đang chờ xử lý!');
@@ -119,12 +119,15 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
         task.priority === 'HIGH' ? '🟠' :
         task.priority === 'LOW' ? '🟢' : '🔵';
 
+      const safeTitle = escapeMarkdown(task.title);
+      const safeDesc = task.description ? escapeMarkdown(task.description) : '';
+
       const text = `
-${priorityEmoji} *${task.title}*
+${priorityEmoji} *${safeTitle}*
 ⏰ Hạn chót: ${formatDisplayDate(task.due_at, timezone)}
 🔔 Nhắc tiếp: ${formatDisplayDate(task.remind_at, timezone)}
 ${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`` : ''}
-${task.description ? `📝 ${task.description}` : ''}
+${safeDesc ? `📝 ${safeDesc}` : ''}
       `.trim();
 
       await this.telegram.sendMessage(chatId, text, {
@@ -148,7 +151,7 @@ ${task.description ? `📝 ${task.description}` : ''}
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i];
       const p = task.priority === 'CRITICAL' ? '🔥' : '📌';
-      message += `${i + 1}. ${p} *${task.title}* (${formatDisplayDate(task.due_at, timezone)})\n`;
+      message += `${i + 1}. ${p} *${escapeMarkdown(task.title)}* (${formatDisplayDate(task.due_at, timezone)})\n`;
     }
 
     await this.telegram.sendMessage(chatId, message, { parse_mode: 'Markdown' });
@@ -156,13 +159,20 @@ ${task.description ? `📝 ${task.description}` : ''}
 
   private async handleSync(chatId: number, userId: number): Promise<void> {
     const user = await this.taskService.getUser(userId);
-    const hasICloud = !!(user?.icloud_apple_id && user.icloud_app_password_enc);
-    const unsynced = await this.taskService.getUnsyncedIosTasks();
-    const userUnsynced = unsynced.filter((t) => t.user_id === userId);
+    const hasICloud = !!(
+      user?.icloud_apple_id &&
+      user.icloud_app_password_enc &&
+      user.icloud_calendar_url
+    );
+    const userUnsynced = await this.taskService.getUnsyncedIosTasks(100, userId);
+    const syncMode = hasICloud
+      ? 'Dual-Adapter (iCloud CalDAV + iOS Shortcuts)'
+      : 'iOS Shortcuts REST Bridge (Native Apple Reminders)';
 
     const text = `
 📱 *TRẠNG THÁI ĐỒNG BỘ iOS REMINDERS*
-• Phương thức: iOS Shortcuts REST Bridge (Native Apple Reminders)
+• Phương thức: ${syncMode}
+• Kết nối iCloud CalDAV: *${hasICloud ? 'Đã cấu hình ✅' : 'Chưa cấu hình'}*
 • Số task đang chờ đồng bộ về iPhone: *${userUnsynced.length}*
 
 💡 _Mẹo: Mở app Lời nhắc trên iPhone để Phím tắt tự động kéo task về._
@@ -188,16 +198,15 @@ ${task.description ? `📝 ${task.description}` : ''}
       await this.taskService.updateUserTimezone(userId, timezone);
       await this.telegram.sendMessage(
         chatId,
-        `✅ Đã cập nhật múi giờ của bạn thành: \`${timezone}\``,
+        `✅ Đã cập nhật múi giờ của bạn thành: \`${escapeMarkdown(timezone)}\``,
         { parse_mode: 'Markdown' }
       );
     } catch {
       await this.telegram.sendMessage(
         chatId,
-        `❌ Múi giờ không hợp lệ (\`${timezone}\`). Vui lòng dùng định dạng chuẩn IANA (VD: \`Asia/Ho_Chi_Minh\`, \`Asia/Tokyo\`).`,
+        `❌ Múi giờ không hợp lệ (\`${escapeMarkdown(timezone)}\`). Vui lòng dùng định dạng chuẩn IANA (VD: \`Asia/Ho_Chi_Minh\`, \`Asia/Tokyo\`).`,
         { parse_mode: 'Markdown' }
       );
     }
   }
-
 }
