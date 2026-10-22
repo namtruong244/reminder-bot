@@ -1,8 +1,67 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { NlpService } from '../src/services/nlp.service';
 
 describe('NlpService', () => {
-  const service = new NlpService(); // Fallback heuristic mode
+  const service = new NlpService(); // Fallback heuristic mode (no API key)
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('prioritizes Gemini API first when apiKey is configured', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      intent: 'CREATE_TASK',
+                      title: 'Họp chiến lược quý 4',
+                      description: 'Chuẩn bị slide doanh thu',
+                      due_at_iso: '2026-10-23T15:00:00+07:00',
+                      remind_before_minutes: 15,
+                      priority: 'CRITICAL',
+                      nagging_mode: true,
+                      recurrence_rrule: null,
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    const apiService = new NlpService('test_gemini_api_key');
+    const result = await apiService.parseUserPrompt(
+      'Nhắc tôi 3h chiều mai họp chiến lược quý 4, nhớ chuẩn bị slide doanh thu, việc gấp'
+    );
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Họp chiến lược quý 4');
+    expect(result.description).toBe('Chuẩn bị slide doanh thu');
+    expect(result.remind_before_minutes).toBe(15);
+  });
+
+  it('falls back to local regex parser when Gemini API fails or times out', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response('Service Unavailable', { status: 503 })
+    );
+
+    const apiService = new NlpService('test_gemini_api_key');
+    const result = await apiService.parseUserPrompt('trưa mai làm báo cáo tài chính');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('làm báo cáo tài chính');
+    expect(result.due_at_iso).toContain('T12:00:00+07:00');
+  });
 
   it('detects list tasks intent', async () => {
     const result = await service.parseUserPrompt('Xem danh sách công việc của tôi');

@@ -34,8 +34,8 @@ export class NlpService {
   ) {}
 
   /**
-   * Parses natural language input using fast deterministic rules first,
-   * falling back to Google Gemini Flash API with Structured Outputs for complex inputs.
+   * Parses natural language input by prioritizing Google Gemini Flash API with Structured Outputs first,
+   * and falling back to the local deterministic regex parser if Gemini API is unconfigured or fails.
    */
   async parseUserPrompt(
     text: string,
@@ -46,18 +46,12 @@ export class NlpService {
     const dayOfWeek = getVietnameseDayOfWeek(now, timezone);
     const tzOffset = currentIso.match(/([+-]\d{2}:\d{2})$/)?.[1] || '+07:00';
 
-    // 1. FAST-PATH: Run local regex parser (< 1ms).
-    // If API key is configured and input has complex/ambiguous constructs, defer to Gemini.
-    const fastResult = this.fastPatternParse(text, currentIso, !!this.apiKey);
-    if (fastResult) {
-      return fastResult;
-    }
-
-    // 2. Fallback to heuristic if no Gemini API key is configured
+    // 1. If no Gemini API key is configured, use local deterministic regex parser
     if (!this.apiKey) {
       return this.heuristicFallback(text, currentIso);
     }
 
+    // 2. PRIMARY: Call Google Gemini API with Structured Outputs first
     const systemPrompt = `
 Bạn là trợ lý AI chuyên phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
 Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
@@ -146,19 +140,25 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       }
 
       const parsed = JSON.parse(rawJson) as NlpExtractedTask;
+      if (parsed.intent === 'UNKNOWN') {
+        const fastFallback = this.fastPatternParse(text, currentIso);
+        if (fastFallback) {
+          return fastFallback;
+        }
+      }
       return parsed;
     } catch (err) {
-      console.error('Failed to parse with Gemini API:', err);
+      console.error('Failed to parse with Gemini API, falling back to local parser:', err);
       return this.heuristicFallback(text, currentIso);
     }
   }
 
   /**
-   * Lightweight deterministic fallback when Gemini API is unavailable.
+   * Deterministic fallback when Gemini API is unavailable, times out, or has no API key.
    */
   private heuristicFallback(text: string, currentIso: string): NlpExtractedTask {
     return (
-      this.fastPatternParse(text, currentIso, false) || {
+      this.fastPatternParse(text, currentIso) || {
         intent: 'CREATE_TASK',
         title: this.buildCleanTitle(text) || text,
         due_at_iso: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
@@ -171,13 +171,12 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
   }
 
   /**
-   * Fast-path deterministic parser for common Vietnamese time/task phrases.
-   * Resolves phrases in < 1ms without calling external LLM.
+   * Deterministic regex parser for common Vietnamese time/task phrases.
+   * Used as fallback when Gemini API is unavailable or unconfigured.
    */
   private fastPatternParse(
     text: string,
-    currentIso: string,
-    hasExternalLlm = false
+    currentIso: string
   ): NlpExtractedTask | null {
     const lower = text.toLowerCase().trim();
 
@@ -237,11 +236,6 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     );
     if (recurResult) {
       return recurResult;
-    }
-
-    // If external LLM is available and prompt contains complex relative dates (e.g. "tháng sau", "cuối tuần", "năm sau"), defer to LLM
-    if (hasExternalLlm && /\b(?:tháng\s+sau|tháng\s+tới|năm\s+sau|cuối\s+tuần|cuối\s+tháng)\b/.test(lower)) {
-      return null;
     }
 
     // Clean out "nhắc trước X phút" before parsing due time so it doesn't get confused with relative due time
