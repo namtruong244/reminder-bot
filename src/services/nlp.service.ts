@@ -30,7 +30,7 @@ const GEMINI_JSON_SCHEMA = {
 export class NlpService {
   constructor(
     private apiKey?: string,
-    private model: string = 'gemini-2.5-flash'
+    private model: string = 'gemini-3.8-flash'
   ) {}
 
   /**
