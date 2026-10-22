@@ -1,5 +1,5 @@
 import { TaskRecord, UserRecord, TaskStatus, TaskPriority } from '../types/task';
-import { DEFAULT_TZ } from '../utils/datetime';
+import { DEFAULT_TZ, getDayRangeUtc } from '../utils/datetime';
 
 export class TaskService {
   constructor(private db: D1Database) {}
@@ -179,30 +179,17 @@ export class TaskService {
    * Fetches today's tasks for a user based on user's timezone.
    */
   async getTodayTasks(userId: number, timezone = DEFAULT_TZ): Promise<TaskRecord[]> {
-    // Get start and end of today in user's timezone converted to UTC ISO
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    });
-    const parts = formatter.formatToParts(now);
-    const lookup: Record<string, string> = {};
-    for (const p of parts) {
-      lookup[p.type] = p.value;
-    }
-    const todayStr = `${lookup.year}-${lookup.month}-${lookup.day}`;
+    const { startUtc, endUtc } = getDayRangeUtc(new Date(), timezone);
 
-    // Tasks due or pending where local date matches today
     const query = `
       SELECT * FROM tasks
       WHERE user_id = ?
         AND status = 'PENDING'
-        AND date(due_at, '+7 hours') = ?
+        AND due_at >= ?
+        AND due_at <= ?
       ORDER BY due_at ASC;
     `;
-    const { results } = await this.db.prepare(query).bind(userId, todayStr).all<TaskRecord>();
+    const { results } = await this.db.prepare(query).bind(userId, startUtc, endUtc).all<TaskRecord>();
     return results || [];
   }
 

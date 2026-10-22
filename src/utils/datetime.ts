@@ -194,8 +194,37 @@ export function getTomorrowMorningIso(timezone: string = DEFAULT_TZ, hour = 9, m
 }
 
 /**
+ * Returns UTC range (start of day, end of day) for a date in the given timezone.
+ * Start: YYYY-MM-DDT00:00:00 in timezone -> UTC ISO
+ * End: YYYY-MM-DDT23:59:59.999 in timezone -> UTC ISO
+ */
+export function getDayRangeUtc(date: Date = new Date(), timezone: string = DEFAULT_TZ): { startUtc: string; endUtc: string } {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(date);
+
+  const lookup: Record<string, string> = {};
+  for (const p of parts) {
+    lookup[p.type] = p.value;
+  }
+
+  const offset = getTimezoneOffsetString(date, timezone);
+  const startLocalIso = `${lookup.year}-${lookup.month}-${lookup.day}T00:00:00${offset}`;
+  const startUtc = toUtcIso(startLocalIso, timezone);
+
+  // End of day is 24 hours (86400000 ms) - 1 ms after start
+  const startDate = new Date(startUtc);
+  const endUtc = new Date(startDate.getTime() + 24 * 60 * 60 * 1000 - 1).toISOString();
+
+  return { startUtc, endUtc };
+}
+
+/**
  * Advances recurrence for recurring tasks based on basic iCalendar RRULE.
- * Supports FREQ=DAILY, FREQ=WEEKLY, FREQ=MONTHLY and INTERVAL.
+ * Supports FREQ=DAILY, FREQ=WEEKLY, FREQ=MONTHLY, INTERVAL, BYMONTHDAY, and BYDAY.
  */
 export function calculateNextRecurrence(
   dueAtIso: string,
@@ -213,28 +242,51 @@ export function calculateNextRecurrence(
   const intervalMatch = upperRRule.match(/INTERVAL=(\d+)/);
   const interval = intervalMatch ? parseInt(intervalMatch[1], 10) : 1;
 
+  const byMonthDayMatch = upperRRule.match(/BYMONTHDAY=(\d+)/);
+  const byMonthDay = byMonthDayMatch ? parseInt(byMonthDayMatch[1], 10) : null;
+
+  const byDayMatch = upperRRule.match(/BYDAY=([A-Z]{2})/);
+  const byDay = byDayMatch ? byDayMatch[1] : null;
+
   const nextDue = new Date(dueDate);
 
-  if (freq === 'DAILY') {
-    nextDue.setDate(nextDue.getDate() + interval);
-  } else if (freq === 'WEEKLY') {
-    nextDue.setDate(nextDue.getDate() + 7 * interval);
-  } else if (freq === 'MONTHLY') {
-    nextDue.setMonth(nextDue.getMonth() + interval);
-  } else if (freq === 'YEARLY') {
-    nextDue.setFullYear(nextDue.getFullYear() + interval);
-  } else {
-    nextDue.setDate(nextDue.getDate() + 1);
-  }
+  const advanceOnce = () => {
+    if (freq === 'DAILY') {
+      nextDue.setDate(nextDue.getDate() + interval);
+    } else if (freq === 'WEEKLY') {
+      if (byDay) {
+        const dayMap: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+        const targetDay = dayMap[byDay] ?? 1;
+        const currentDay = nextDue.getDay();
+        let daysToAdd = (targetDay - currentDay + 7) % 7;
+        if (daysToAdd === 0) daysToAdd = 7 * interval;
+        nextDue.setDate(nextDue.getDate() + daysToAdd);
+      } else {
+        nextDue.setDate(nextDue.getDate() + 7 * interval);
+      }
+    } else if (freq === 'MONTHLY') {
+      nextDue.setMonth(nextDue.getMonth() + interval);
+      if (byMonthDay !== null) {
+        nextDue.setDate(byMonthDay);
+      }
+    } else if (freq === 'YEARLY') {
+      nextDue.setFullYear(nextDue.getFullYear() + interval);
+      if (byMonthDay !== null) {
+        nextDue.setDate(byMonthDay);
+      }
+    } else {
+      nextDue.setDate(nextDue.getDate() + 1);
+    }
+  };
+
+  advanceOnce();
 
   // If next due is still in the past, advance until future
   const now = Date.now();
-  while (nextDue.getTime() <= now) {
-    if (freq === 'DAILY') nextDue.setDate(nextDue.getDate() + interval);
-    else if (freq === 'WEEKLY') nextDue.setDate(nextDue.getDate() + 7 * interval);
-    else if (freq === 'MONTHLY') nextDue.setMonth(nextDue.getMonth() + interval);
-    else if (freq === 'YEARLY') nextDue.setFullYear(nextDue.getFullYear() + interval);
-    else nextDue.setDate(nextDue.getDate() + 1);
+  let iterations = 0;
+  while (nextDue.getTime() <= now && iterations < 100) {
+    advanceOnce();
+    iterations++;
   }
 
   const nextDueIso = nextDue.toISOString();

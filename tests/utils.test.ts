@@ -9,6 +9,7 @@ import {
   calculateNextRecurrence,
   getNowWithTimezone,
   getVietnameseDayOfWeek,
+  getDayRangeUtc,
 } from '../src/utils/datetime';
 
 describe('Crypto Utils', () => {
@@ -73,5 +74,24 @@ describe('Datetime Utils', () => {
     const date = new Date('2026-10-21T08:00:00Z'); // Wednesday in 2026
     const day = getVietnameseDayOfWeek(date, 'Asia/Ho_Chi_Minh');
     expect(day).toBe('Thứ Tư');
+  });
+
+  it('calculates next recurrence for monthly rule with BYMONTHDAY=4', () => {
+    const dueAt = '2026-10-04T02:00:00.000Z'; // 09:00 VN
+    const remindAt = '2026-10-04T02:00:00.000Z';
+    const { dueAt: nextDue } = calculateNextRecurrence(dueAt, remindAt, 'FREQ=MONTHLY;BYMONTHDAY=4');
+    const nextDate = new Date(nextDue);
+    expect(nextDate.getUTCDate()).toBe(4);
+    // Should be in the future
+    expect(nextDate.getTime()).toBeGreaterThan(Date.now());
+  });
+
+  it('calculates getDayRangeUtc correctly in Asia/Ho_Chi_Minh', () => {
+    const date = new Date('2026-10-22T03:00:00.000Z'); // 10:00 AM VN on Oct 22
+    const { startUtc, endUtc } = getDayRangeUtc(date, 'Asia/Ho_Chi_Minh');
+    // Start of Oct 22 in VN is Oct 21 17:00:00 UTC
+    expect(startUtc).toBe('2026-10-21T17:00:00.000Z');
+    // End of Oct 22 in VN is Oct 22 16:59:59.999 UTC
+    expect(endUtc).toBe('2026-10-22T16:59:59.999Z');
   });
 });
