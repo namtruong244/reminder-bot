@@ -60,6 +60,19 @@ export class NlpService {
     this.model = model?.trim() || 'gemini-3.8-flash';
   }
 
+  getApiKeyStatus(): { configured: boolean; preview?: string; length?: number } {
+    if (!this.apiKey) {
+      return { configured: false };
+    }
+    const len = this.apiKey.length;
+    const preview = len > 8 ? `${this.apiKey.substring(0, 6)}...${this.apiKey.substring(len - 4)}` : '******';
+    return { configured: true, preview, length: len };
+  }
+
+  getModel(): string {
+    return this.model;
+  }
+
   /**
    * Parses natural language input by prioritizing Google Gemini Flash API with Structured Outputs first,
    * and falling back to the local deterministic regex parser if Gemini API is unconfigured or fails.
@@ -73,9 +86,19 @@ export class NlpService {
     const dayOfWeek = getVietnameseDayOfWeek(now, timezone);
     const tzOffset = currentIso.match(/([+-]\d{2}:\d{2})$/)?.[1] || '+07:00';
 
-    // 1. If no Gemini API key is configured, use local deterministic regex parser
+    // 1. If no Gemini API key is configured, log clearly and use local deterministic regex parser
     if (!this.apiKey) {
-      return this.heuristicFallback(text, currentIso);
+      console.warn(
+        `[NLP-DEBUG] ⚠️ GEMINI_API_KEY is NOT CONFIGURED or EMPTY! Bypassing Gemini and using local Regex parser.`
+      );
+      const fallback = this.heuristicFallback(text, currentIso);
+      fallback.debug = {
+        source: 'REGEX_NO_API_KEY',
+        model: this.model,
+        apiKeyConfigured: false,
+        error: 'Chưa cài đặt GEMINI_API_KEY trong Cloudflare Workers Secrets',
+      };
+      return fallback;
     }
 
     // 2. PRIMARY: Call Google Gemini API with Structured Outputs
@@ -128,47 +151,200 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       modelsToTry.push('gemini-2.5-flash');
     }
 
+    const startOverall = Date.now();
+    let lastError: string | undefined;
+
     for (const modelToUse of modelsToTry) {
       try {
+        console.log(`[NLP-DEBUG] 🚀 Calling Gemini API (model: ${modelToUse}) for: "${text}"`);
+        const startTime = Date.now();
+
         // Attempt 1: with thinkingBudget: 0 (disable internal CoT for sub-second response)
         let res = await this.requestGemini(modelToUse, text, systemPrompt, true);
 
         // If HTTP 400 Bad Request, model might not support thinkingBudget: 0. Retry without thinkingConfig.
         if (!res.ok && res.status === 400) {
-          console.warn(`[NLP] Gemini 400 with thinkingBudget: 0 on ${modelToUse}. Retrying without thinkingConfig...`);
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini 400 with thinkingBudget: 0 on ${modelToUse}. Retrying without thinkingConfig...`);
           res = await this.requestGemini(modelToUse, text, systemPrompt, false);
         }
 
+        const callDuration = Date.now() - startTime;
+
         // If HTTP 404 (model ID not found in API version/account), try fallback model
         if (!res.ok && res.status === 404) {
-          console.warn(`[NLP] Gemini model ${modelToUse} returned 404 Not Found. Trying fallback model...`);
+          lastError = `Model ${modelToUse} returned 404 Not Found`;
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} returned 404 Not Found (${callDuration}ms). Trying fallback model...`);
           continue;
         }
 
         if (!res.ok) {
-          console.error(`[NLP] Gemini API error on model ${modelToUse} (${res.status}):`, res.error);
+          lastError = `HTTP ${res.status}: ${res.error}`;
+          console.error(`[NLP-DEBUG] ❌ Gemini API error on model ${modelToUse} (${res.status}, ${callDuration}ms):`, res.error);
           break; // Stop immediately on non-404 errors (e.g. 503, 403, 429) and use regex fallback
         }
 
         // Extract JSON string from response candidates (handling thought parts and markdown fences)
         const rawJson = this.extractJsonFromCandidate(res.data?.candidates?.[0]);
         if (!rawJson) {
-          console.warn(`[NLP] Gemini model ${modelToUse} returned no valid JSON part, raw response:`, JSON.stringify(res.data));
+          lastError = 'Gemini returned response without valid JSON payload';
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} returned no valid JSON part (${callDuration}ms), raw response:`, JSON.stringify(res.data));
           break;
         }
 
         const parsed = JSON.parse(rawJson) as NlpExtractedTask;
         const sanitized = this.sanitizeGeminiOutput(parsed, text, currentIso);
-        console.log(`[NLP] Successfully parsed task using Gemini API (${modelToUse}): "${sanitized.title}" [${sanitized.intent}]`);
+        sanitized.debug = {
+          source: 'GEMINI',
+          model: modelToUse,
+          latency_ms: callDuration,
+          apiKeyConfigured: true,
+        };
+        console.log(`[NLP-DEBUG] ✅ Successfully parsed task using Gemini API (${modelToUse}, ${callDuration}ms): "${sanitized.title}" [${sanitized.intent}]`);
         return sanitized;
       } catch (err) {
-        console.error(`[NLP] Error parsing response from Gemini model ${modelToUse}:`, err);
+        lastError = err instanceof Error ? err.message : String(err);
+        console.error(`[NLP-DEBUG] ❌ Error parsing response from Gemini model ${modelToUse}:`, err);
         break;
       }
     }
 
-    console.warn(`[NLP] All Gemini calls failed or timed out. Falling back to local regex parser for: "${text}"`);
-    return this.heuristicFallback(text, currentIso);
+    console.warn(`[NLP-DEBUG] ⚠️ Falling back to local regex parser for: "${text}" (Reason: ${lastError || 'Unknown'})`);
+    const fallback = this.heuristicFallback(text, currentIso);
+    fallback.debug = {
+      source: 'REGEX_FALLBACK',
+      model: this.model,
+      latency_ms: Date.now() - startOverall,
+      apiKeyConfigured: true,
+      error: lastError || 'Gemini API call failed',
+    };
+    return fallback;
+  }
+
+  /**
+   * Diagnostic trace helper for /debug command and /api/debug/nlp endpoint.
+   */
+  async parseWithDetailedTrace(
+    text: string,
+    timezone: string = DEFAULT_TZ
+  ): Promise<{
+    text: string;
+    apiKeyStatus: { configured: boolean; preview?: string; length?: number };
+    modelConfigured: string;
+    attempts: Array<{
+      model: string;
+      status: number;
+      durationMs: number;
+      error?: string;
+      rawSnippet?: string;
+    }>;
+    result: NlpExtractedTask;
+    source: 'GEMINI' | 'REGEX_FALLBACK' | 'REGEX_NO_API_KEY';
+  }> {
+    const attempts: Array<{
+      model: string;
+      status: number;
+      durationMs: number;
+      error?: string;
+      rawSnippet?: string;
+    }> = [];
+
+    const apiKeyStatus = this.getApiKeyStatus();
+    const now = new Date();
+    const currentIso = getNowWithTimezone(now, timezone);
+    const dayOfWeek = getVietnameseDayOfWeek(now, timezone);
+    const tzOffset = currentIso.match(/([+-]\d{2}:\d{2})$/)?.[1] || '+07:00';
+
+    if (!this.apiKey) {
+      const fallback = this.heuristicFallback(text, currentIso);
+      fallback.debug = {
+        source: 'REGEX_NO_API_KEY',
+        model: this.model,
+        apiKeyConfigured: false,
+        error: 'Chưa cài đặt GEMINI_API_KEY trong Cloudflare Workers Secrets',
+      };
+      return {
+        text,
+        apiKeyStatus,
+        modelConfigured: this.model,
+        attempts,
+        result: fallback,
+        source: 'REGEX_NO_API_KEY',
+      };
+    }
+
+    const systemPrompt = `
+Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
+Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
+Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
+Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON theo đúng schema.
+    `.trim();
+
+    const modelsToTry = [this.model];
+    if (this.model !== 'gemini-2.5-flash') {
+      modelsToTry.push('gemini-2.5-flash');
+    }
+
+    let finalResult: NlpExtractedTask | null = null;
+    let finalSource: 'GEMINI' | 'REGEX_FALLBACK' | 'REGEX_NO_API_KEY' = 'REGEX_FALLBACK';
+
+    for (const modelToUse of modelsToTry) {
+      const start = Date.now();
+      let res = await this.requestGemini(modelToUse, text, systemPrompt, true);
+      if (!res.ok && res.status === 400) {
+        res = await this.requestGemini(modelToUse, text, systemPrompt, false);
+      }
+      const dur = Date.now() - start;
+
+      const rawJson = this.extractJsonFromCandidate(res.data?.candidates?.[0]);
+
+      attempts.push({
+        model: modelToUse,
+        status: res.status,
+        durationMs: dur,
+        error: res.error,
+        rawSnippet: rawJson ? rawJson.slice(0, 300) : (res.error?.slice(0, 300) || JSON.stringify(res.data)?.slice(0, 300)),
+      });
+
+      if (res.ok && rawJson) {
+        try {
+          const parsed = JSON.parse(rawJson) as NlpExtractedTask;
+          finalResult = this.sanitizeGeminiOutput(parsed, text, currentIso);
+          finalResult.debug = {
+            source: 'GEMINI',
+            model: modelToUse,
+            latency_ms: dur,
+            apiKeyConfigured: true,
+          };
+          finalSource = 'GEMINI';
+          break;
+        } catch {}
+      }
+
+      if (!res.ok && res.status === 404) {
+        continue;
+      }
+      break;
+    }
+
+    if (!finalResult) {
+      finalResult = this.heuristicFallback(text, currentIso);
+      finalResult.debug = {
+        source: 'REGEX_FALLBACK',
+        model: this.model,
+        apiKeyConfigured: true,
+        error: attempts[0]?.error || 'Gemini call failed',
+      };
+      finalSource = 'REGEX_FALLBACK';
+    }
+
+    return {
+      text,
+      apiKeyStatus,
+      modelConfigured: this.model,
+      attempts,
+      result: finalResult,
+      source: finalSource,
+    };
   }
 
   /**

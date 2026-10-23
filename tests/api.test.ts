@@ -100,6 +100,40 @@ describe('Hono API Routes', () => {
     expect(infoRes.status).toBe(401);
   });
 
+  it('GET /api/debug returns environment and secrets status safely', async () => {
+    const res = await app.fetch(new Request('http://localhost/api/debug'), env);
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      status: string;
+      gemini: { api_key_configured: boolean; model: string };
+      database: { healthy: boolean };
+    };
+    expect(data.status).toBe('ok');
+    expect(data.gemini.api_key_configured).toBe(false);
+    expect(data.gemini.model).toBe('gemini-3.8-flash');
+    expect(data.database.healthy).toBe(true);
+  });
+
+  it('GET /api/debug/nlp returns full trace or error on missing prompt', async () => {
+    const errRes = await app.fetch(new Request('http://localhost/api/debug/nlp'), env);
+    expect(errRes.status).toBe(400);
+
+    const validRes = await app.fetch(
+      new Request('http://localhost/api/debug/nlp?prompt=mai+9h+hop'),
+      env
+    );
+    expect(validRes.status).toBe(200);
+    const trace = (await validRes.json()) as {
+      text: string;
+      source: string;
+      result: { intent: string; title: string };
+    };
+    expect(trace.text).toBe('mai 9h hop');
+    expect(trace.source).toBe('REGEX_NO_API_KEY');
+    expect(trace.result.intent).toBe('CREATE_TASK');
+    expect(trace.result.title).toBe('hop');
+  });
+
   it('rejects /api/ios/unsynced without Bearer token', async () => {
     const res = await app.fetch(new Request('http://localhost/api/ios/unsynced'), env);
     expect(res.status).toBe(401);

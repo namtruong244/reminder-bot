@@ -32,6 +32,14 @@ export interface TaskRecord {
   updated_at?: string;
 }
 
+export interface NlpDebugInfo {
+  source: 'GEMINI' | 'REGEX_FALLBACK' | 'REGEX_NO_API_KEY';
+  model?: string;
+  latency_ms?: number;
+  apiKeyConfigured?: boolean;
+  error?: string;
+}
+
 export interface NlpExtractedTask {
   intent: 'CREATE_TASK' | 'LIST_TASKS' | 'CANCEL_TASK' | 'UNKNOWN';
   title?: string | null;
@@ -41,6 +49,7 @@ export interface NlpExtractedTask {
   priority?: TaskPriority | null;
   nagging_mode?: boolean | null;
   recurrence_rrule?: string | null;
+  debug?: NlpDebugInfo;
 }
 
 export interface CalDavConfig {

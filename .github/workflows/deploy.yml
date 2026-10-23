@@ -68,6 +68,28 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
+      - name: Sync Secrets to Cloudflare Worker (if present in GitHub Secrets)
+        run: |
+          if [ -n "$GEMINI_API_KEY" ]; then
+            echo "$GEMINI_API_KEY" | pnpm exec wrangler secret put GEMINI_API_KEY
+          fi
+          if [ -n "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "$TELEGRAM_BOT_TOKEN" | pnpm exec wrangler secret put TELEGRAM_BOT_TOKEN
+          fi
+          if [ -n "$TELEGRAM_WEBHOOK_SECRET" ]; then
+            echo "$TELEGRAM_WEBHOOK_SECRET" | pnpm exec wrangler secret put TELEGRAM_WEBHOOK_SECRET
+          fi
+          if [ -n "$ENCRYPTION_SECRET_KEY" ]; then
+            echo "$ENCRYPTION_SECRET_KEY" | pnpm exec wrangler secret put ENCRYPTION_SECRET_KEY
+          fi
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_WEBHOOK_SECRET: ${{ secrets.TELEGRAM_WEBHOOK_SECRET }}
+          ENCRYPTION_SECRET_KEY: ${{ secrets.ENCRYPTION_SECRET_KEY }}
+
       - name: Deploy Worker
         run: pnpm exec wrangler deploy
         env:

@@ -4,6 +4,7 @@ import { TelegramWebhookHandler } from './bot/webhook';
 import { TelegramApi } from './bot/telegram';
 import { NotifierService } from './services/notifier.service';
 import { TaskService } from './services/task.service';
+import { NlpService } from './services/nlp.service';
 import {
   calculateNextRecurrence,
   escapeMarkdown,
@@ -27,6 +28,83 @@ const requireAdminAuth = async (c: Context<{ Bindings: Env }>, next: Next) => {
 // Healthcheck
 app.get('/', (c) => c.text('Telegram Smart Reminder Bot is running on Cloudflare Workers! 🚀'));
 app.get('/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// ================= DIAGNOSTIC & DEBUG ENDPOINTS =================
+
+/**
+ * GET /api/debug
+ * Returns current health, secret status (safely masked), and configuration.
+ */
+app.get('/api/debug', async (c) => {
+  let dbHealthy = false;
+  let dbError: string | null = null;
+  let userCount = 0;
+  let taskCount = 0;
+
+  try {
+    const uRes = await c.env.DB.prepare('SELECT count(*) as count FROM users;').first<{ count: number }>();
+    const tRes = await c.env.DB.prepare('SELECT count(*) as count FROM tasks;').first<{ count: number }>();
+    dbHealthy = true;
+    userCount = uRes?.count ?? 0;
+    taskCount = tRes?.count ?? 0;
+  } catch (err) {
+    dbError = err instanceof Error ? err.message : String(err);
+  }
+
+  const nlp = new NlpService(c.env.GEMINI_API_KEY, c.env.LLM_MODEL);
+  const geminiStatus = nlp.getApiKeyStatus();
+
+  return c.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    gemini: {
+      api_key_configured: geminiStatus.configured,
+      api_key_preview: geminiStatus.preview || 'NOT_CONFIGURED',
+      api_key_length: geminiStatus.length || 0,
+      model: nlp.getModel(),
+      instruction_if_not_configured: !geminiStatus.configured
+        ? 'Chưa cấu hình GEMINI_API_KEY! Chạy lệnh: pnpm exec wrangler secret put GEMINI_API_KEY'
+        : 'Sẵn sàng hoạt động ✅',
+    },
+    telegram: {
+      bot_token_configured: !!c.env.TELEGRAM_BOT_TOKEN,
+      webhook_secret_configured: !!c.env.TELEGRAM_WEBHOOK_SECRET,
+    },
+    database: {
+      healthy: dbHealthy,
+      user_count: userCount,
+      task_count: taskCount,
+      error: dbError,
+    },
+    system: {
+      default_timezone: c.env.DEFAULT_TIMEZONE || 'Asia/Ho_Chi_Minh',
+      encryption_secret_configured: !!c.env.ENCRYPTION_SECRET_KEY,
+    },
+  });
+});
+
+/**
+ * GET /api/debug/nlp
+ * Tests NLP parsing for a given text prompt with full execution trace.
+ * Query param: ?prompt=... or ?text=...
+ */
+app.get('/api/debug/nlp', async (c) => {
+  const prompt = c.req.query('prompt') || c.req.query('text');
+  if (!prompt) {
+    return c.json(
+      {
+        error: 'Missing query parameter "prompt" or "text". Example: /api/debug/nlp?prompt=mai+3h+chieu+hop',
+      },
+      400
+    );
+  }
+
+  const tz = c.req.query('tz') || c.env.DEFAULT_TIMEZONE || 'Asia/Ho_Chi_Minh';
+  const nlp = new NlpService(c.env.GEMINI_API_KEY, c.env.LLM_MODEL);
+  const trace = await nlp.parseWithDetailedTrace(prompt, tz);
+
+  return c.json(trace);
+});
 
 // Telegram Webhook
 app.post('/webhook/telegram', async (c) => {

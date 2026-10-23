@@ -46,8 +46,8 @@ export class TelegramWebhookHandler {
   constructor(private env: Env) {
     this.telegram = new TelegramApi(env.TELEGRAM_BOT_TOKEN);
     this.taskService = new TaskService(env.DB);
-    this.commands = new BotCommands(env, this.telegram, this.taskService);
     this.nlpService = new NlpService(env.GEMINI_API_KEY, env.LLM_MODEL);
+    this.commands = new BotCommands(env, this.telegram, this.taskService, this.nlpService);
     this.icloudService = new ICloudCalDavService(env.ENCRYPTION_SECRET_KEY);
   }
 
@@ -255,6 +255,16 @@ export class TelegramWebhookHandler {
         confirmText += `\n⚠️ Chế độ nhắc liên tục (mỗi 10 phút) đã được kích hoạt.`;
       }
 
+      if (nlpResult.debug) {
+        if (nlpResult.debug.source === 'GEMINI') {
+          confirmText += `\n\n🤖 _Phân tích bởi: Gemini ${nlpResult.debug.model || 'Flash'} (${nlpResult.debug.latency_ms || 0}ms)_`;
+        } else if (nlpResult.debug.source === 'REGEX_NO_API_KEY') {
+          confirmText += `\n\n⚠️ _Phân tích bởi: Regex (Lý do: Chưa cài đặt GEMINI_API_KEY trên Cloudflare Secrets! Dùng /debug để xem hướng dẫn)_`;
+        } else {
+          confirmText += `\n\n⚠️ _Phân tích bởi: Regex dự phòng (Lỗi Gemini: ${escapeMarkdown(nlpResult.debug.error || 'Timeout/Error')})_`;
+        }
+      }
+
       await this.telegram.sendMessage(chatId, confirmText, {
         parse_mode: 'Markdown',
         reply_markup: createTaskCreatedKeyboard(taskId),
@@ -263,11 +273,16 @@ export class TelegramWebhookHandler {
     }
 
     // Default response if prompt could not be parsed into a task
-    await this.telegram.sendMessage(
-      chatId,
-      `Tôi chưa hiểu rõ yêu cầu nhắc việc của bạn. Hãy thử nhắn rõ thời gian, ví dụ:\n• _"9h sáng mai họp với phòng kinh doanh"_\n• _"Nhắc tôi uống thuốc sau 15 phút nữa, việc gấp"_`,
-      { parse_mode: 'Markdown' }
-    );
+    let failMsg = `Tôi chưa hiểu rõ yêu cầu nhắc việc của bạn. Hãy thử nhắn rõ thời gian, ví dụ:\n• _"9h sáng mai họp với phòng kinh doanh"_\n• _"Nhắc tôi uống thuốc sau 15 phút nữa, việc gấp"_`;
+    if (nlpResult.debug) {
+      if (nlpResult.debug.source === 'REGEX_NO_API_KEY') {
+        failMsg += `\n\n⚠️ _[Debug] Chưa cấu hình GEMINI_API_KEY trên Cloudflare Secrets! Bot đang chạy Regex dự phòng._`;
+      } else if (nlpResult.debug.error) {
+        failMsg += `\n\n🔍 _[Debug] Lỗi Gemini: ${escapeMarkdown(nlpResult.debug.error)}_`;
+      }
+    }
+
+    await this.telegram.sendMessage(chatId, failMsg, { parse_mode: 'Markdown' });
   }
 
   private async handleCallbackQuery(
