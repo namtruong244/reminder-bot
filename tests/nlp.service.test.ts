@@ -199,18 +199,59 @@ describe('NlpService', () => {
     expect(result.title).toBe('Tập thể dục');
   });
 
-  it('falls back to local regex parser when Gemini API fails or times out', async () => {
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
-      new Response('Service Unavailable', { status: 503 })
-    );
+  it('tries fallback model if primary model times out', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockRejectedValueOnce(new Error('The operation was aborted due to timeout'))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        intent: 'CREATE_TASK',
+                        title: 'Tập gym',
+                        due_at_iso: '2026-10-23T18:00:00+07:00',
+                        priority: 'LOW',
+                        nagging_mode: false,
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+    const apiService = new NlpService('test_gemini_api_key', 'gemini-3.8-flash');
+    const result = await apiService.parseUserPrompt('Tối mai tập gym');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Tập gym');
+    expect(result.debug?.source).toBe('GEMINI');
+    expect(result.debug?.model).toBe('gemini-2.5-flash');
+  });
+
+  it('falls back to local regex parser when Gemini API fails on all models', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response('Service Unavailable', { status: 503 }))
+      .mockResolvedValueOnce(new Response('Service Unavailable', { status: 503 }));
 
     const apiService = new NlpService('test_gemini_api_key');
     const result = await apiService.parseUserPrompt('trưa mai làm báo cáo tài chính');
 
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(result.intent).toBe('CREATE_TASK');
     expect(result.title).toBe('làm báo cáo tài chính');
     expect(result.due_at_iso).toContain('T12:00:00+07:00');
+    expect(result.debug?.source).toBe('REGEX_FALLBACK');
   });
 
   it('detects list tasks intent', async () => {

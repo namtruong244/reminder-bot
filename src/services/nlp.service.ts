@@ -159,28 +159,28 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         console.log(`[NLP-DEBUG] 🚀 Calling Gemini API (model: ${modelToUse}) for: "${text}"`);
         const startTime = Date.now();
 
-        // Attempt 1: with thinkingBudget: 0 (disable internal CoT for sub-second response)
+        // Attempt 1: with fast thinking configuration (thinkingLevel: "LOW" on 3.x / thinkingBudget: 0 on 2.5)
         let res = await this.requestGemini(modelToUse, text, systemPrompt, true);
 
-        // If HTTP 400 Bad Request, model might not support thinkingBudget: 0. Retry without thinkingConfig.
+        // If HTTP 400 Bad Request, model might not support thinkingConfig. Retry without thinkingConfig.
         if (!res.ok && res.status === 400) {
-          console.warn(`[NLP-DEBUG] ⚠️ Gemini 400 with thinkingBudget: 0 on ${modelToUse}. Retrying without thinkingConfig...`);
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini 400 with thinkingConfig on ${modelToUse}. Retrying without thinkingConfig...`);
           res = await this.requestGemini(modelToUse, text, systemPrompt, false);
         }
 
         const callDuration = Date.now() - startTime;
 
-        // If HTTP 404 (model ID not found in API version/account), try fallback model
-        if (!res.ok && res.status === 404) {
-          lastError = `Model ${modelToUse} returned 404 Not Found`;
-          console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} returned 404 Not Found (${callDuration}ms). Trying fallback model...`);
+        // If HTTP 404 (model ID not found), HTTP 0 (timeout), or HTTP 503 (capacity overloaded), try fallback model
+        if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 503)) {
+          lastError = res.status === 0 ? 'The operation was aborted due to timeout' : `HTTP ${res.status}: ${res.error}`;
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} failed (status: ${res.status}, ${callDuration}ms). Trying fallback model...`);
           continue;
         }
 
         if (!res.ok) {
           lastError = `HTTP ${res.status}: ${res.error}`;
           console.error(`[NLP-DEBUG] ❌ Gemini API error on model ${modelToUse} (${res.status}, ${callDuration}ms):`, res.error);
-          break; // Stop immediately on non-404 errors (e.g. 503, 403, 429) and use regex fallback
+          break; // Stop immediately on non-recoverable errors (e.g. 401, 403 invalid key)
         }
 
         // Extract JSON string from response candidates (handling thought parts and markdown fences)
@@ -320,7 +320,7 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
         } catch {}
       }
 
-      if (!res.ok && res.status === 404) {
+      if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 503)) {
         continue;
       }
       break;
@@ -348,13 +348,32 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
   }
 
   /**
+   * Builds the appropriate thinkingConfig based on model family.
+   * Gemini 3.x models use thinkingLevel: "LOW" to minimize reasoning latency for schema output.
+   * Gemini 2.5 models use thinkingBudget: 0 to disable thinking entirely.
+   */
+  private buildThinkingConfig(model: string): Record<string, unknown> | undefined {
+    if (model.includes('3.')) {
+      return {
+        thinkingLevel: 'LOW',
+      };
+    }
+    if (model.includes('2.5')) {
+      return {
+        thinkingBudget: 0,
+      };
+    }
+    return undefined;
+  }
+
+  /**
    * Low-level fetch wrapper for Google Gemini REST API.
    */
   private async requestGemini(
     model: string,
     text: string,
     systemPrompt: string,
-    disableThinking: boolean
+    enableFastThinking = true
   ): Promise<{ ok: boolean; status: number; error?: string; data?: GeminiGenerateResponse }> {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
 
@@ -364,10 +383,11 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
       temperature: 0.1,
     };
 
-    if (disableThinking) {
-      generationConfig.thinkingConfig = {
-        thinkingBudget: 0,
-      };
+    if (enableFastThinking) {
+      const thinkingConfig = this.buildThinkingConfig(model);
+      if (thinkingConfig) {
+        generationConfig.thinkingConfig = thinkingConfig;
+      }
     }
 
     const requestBody = {
@@ -386,9 +406,12 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
     try {
       const response = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey || '',
+        },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(12000), // 12s timeout gives ample time while preventing hanging workers
+        signal: AbortSignal.timeout(25000), // 25s timeout ensures complete response without premature abort
       });
 
       if (!response.ok) {
