@@ -74,6 +74,77 @@ export class NlpService {
   }
 
   /**
+   * Generates a unified, high-precision system prompt for Vietnamese reminder extraction.
+   */
+  private getSystemPrompt(
+    currentIso: string,
+    dayOfWeek: string,
+    timezone: string,
+    tzOffset: string
+  ): string {
+    return `
+Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
+Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
+Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
+
+Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON theo đúng schema.
+
+QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH XÁC):
+1. Ngày tháng cụ thể ("ngày D tháng M" hoặc "D/M"):
+   - due_at_iso = YYYY-MM-DDTHH:mm:00${tzOffset} (mặc định 09:00:00 nếu không nói giờ).
+   - Nếu tháng M nhỏ hơn tháng hiện tại trong năm, tính sang năm tiếp theo.
+   - Ví dụ: "ngày 20 tháng 12 đóng tiền lãi ngân hàng" -> due_at_iso = "2026-12-20T09:00:00${tzOffset}", title = "Đóng tiền lãi ngân hàng".
+2. Thời gian tương đối:
+   - "X phút nữa", "sau X phút", "trong X phút", "Xp nữa": due_at_iso = thời gian hiện tại + X phút, remind_before_minutes = 0.
+   - "X tiếng nữa", "sau X giờ", "nửa tiếng nữa": due_at_iso = thời gian hiện tại + X tiếng (hoặc 30 phút), remind_before_minutes = 0.
+3. Thời gian theo buổi trong ngày:
+   - "Sáng": mặc định 08:00 (hoặc nếu nói giờ cụ thể, VD: "9h sáng" = 09:00, "9h30 sáng" = 09:30).
+   - "Trưa": mặc định 12:00 (hoặc "11h trưa" = 11:00, "11h30 trưa" = 11:30, "12 rưỡi trưa" = 12:30).
+   - "Chiều": giờ chiều = giờ + 12 (nếu nói từ 1h-6h, VD: "4h chiều" = 16:00, "4 rưỡi chiều" = 16:30, "4h45 chiều" = 16:45).
+     Nếu người dùng chỉ nói "chiều mai", "chiều nay" mà không nói giờ cụ thể: mặc định 14:00.
+   - "Tối": giờ tối = giờ + 12 (nếu nói từ 6h-11h, VD: "8h tối" = 20:00, "8 rưỡi tối" = 20:30).
+     Nếu người dùng chỉ nói "tối mai", "tối nay" mà không nói giờ cụ thể: mặc định 20:00.
+4. Ngày hẹn:
+   - "Hôm nay", "trưa nay", "chiều nay", "tối nay", "sáng nay": dùng ngày hiện tại (${currentIso.split('T')[0]}).
+   - "Mai", "trưa mai", "sáng mai", "chiều mai", "tối mai": ngày hiện tại + 1 ngày.
+     VD: "trưa mai làm báo cáo" -> ngày mai lúc 12:00:00${tzOffset}, title: "Làm báo cáo".
+   - "Mốt", "ngày kia", "trưa mốt", "sáng mốt", "chiều mốt", "tối mốt": ngày hiện tại + 2 ngày.
+   - "Thứ X tuần sau": Tính đúng ngày Thứ X của tuần kế tiếp (Tuần bắt đầu từ Thứ Hai).
+5. Việc lặp lại định kỳ (recurrence_rrule):
+   - "ngày X hàng tháng" (hoặc "ngày X mỗi tháng", "mỗi tháng ngày X"):
+     + recurrence_rrule = "FREQ=MONTHLY;BYMONTHDAY=X".
+     + due_at_iso: Nếu ngày X của tháng hiện tại đã qua so với thời điểm hiện tại, lần nhắc đầu tiên PHẢI là ngày X của THÁNG KẾ TIẾP! (Nếu là tháng 12 thì sang tháng 1 năm sau). Nếu ngày X chưa tới trong tháng này, lấy ngày X của tháng này. Mặc định 09:00:00 sáng nếu không nói giờ.
+   - "mỗi ngày" / "hàng ngày": recurrence_rrule = "FREQ=DAILY".
+   - "thứ X hàng tuần" / "thứ X mỗi tuần": recurrence_rrule = "FREQ=WEEKLY;BYDAY=...".
+6. Quy tắc trường due_at_iso:
+   - BẮT BUỘC có offset múi giờ ${tzOffset} (Ví dụ: "2026-10-23T12:00:00${tzOffset}").
+   - TUYỆT ĐỐI KHÔNG dùng ký tự "Z" và KHÔNG ĐƯỢC bỏ trống phần offset.
+7. Tiêu đề (title):
+   - Chỉ giữ lại nội dung công việc cốt lõi, LOẠI BỎ các từ chỉ thời gian và lời chào/mệnh lệnh như "nhắc tôi", "nhắc mình", "ngày 20 tháng 12", "trưa mai", "ngày 4 hàng tháng", "chiều nay"...
+   - Đối với intent "CREATE_TASK", trường "title" KHÔNG ĐƯỢC để trống hoặc null.
+8. Mức độ ưu tiên (priority):
+   - Nếu có từ "gấp", "quan trọng", "nhớ nhắc kỹ", "khẩn": priority = "CRITICAL", nagging_mode = true.
+   - Bình thường: priority = "MEDIUM", nagging_mode = false.
+9. Nếu người dùng muốn xem/liệt kê danh sách việc: intent = "LIST_TASKS".
+   Nếu người dùng muốn hủy/xóa việc: intent = "CANCEL_TASK".
+`.trim();
+  }
+
+  /**
+   * Returns list of models to try in order: primary model followed by resilient Gemini 3 fallbacks.
+   */
+  private getCandidateModels(): string[] {
+    const list = [this.model];
+    const fallbacks = ['gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-flash-lite-latest'];
+    for (const fb of fallbacks) {
+      if (!list.includes(fb)) {
+        list.push(fb);
+      }
+    }
+    return list;
+  }
+
+  /**
    * Parses natural language input by prioritizing Google Gemini Flash API with Structured Outputs first,
    * and falling back to the local deterministic regex parser if Gemini API is unconfigured or fails.
    */
@@ -102,54 +173,8 @@ export class NlpService {
     }
 
     // 2. PRIMARY: Call Google Gemini API with Structured Outputs
-    const systemPrompt = `
-Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
-Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
-Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
-
-Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON theo đúng schema.
-
-QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH XÁC):
-1. Thời gian tương đối:
-   - "X phút nữa", "sau X phút", "trong X phút", "Xp nữa": due_at_iso = thời gian hiện tại + X phút, remind_before_minutes = 0.
-   - "X tiếng nữa", "sau X giờ", "nửa tiếng nữa": due_at_iso = thời gian hiện tại + X tiếng (hoặc 30 phút), remind_before_minutes = 0.
-2. Thời gian theo buổi trong ngày:
-   - "Sáng": mặc định 08:00 (hoặc nếu nói giờ cụ thể, VD: "9h sáng" = 09:00, "9h30 sáng" = 09:30).
-   - "Trưa": mặc định 12:00 (hoặc "11h trưa" = 11:00, "11h30 trưa" = 11:30, "12 rưỡi trưa" = 12:30).
-   - "Chiều": giờ chiều = giờ + 12 (nếu nói từ 1h-6h, VD: "4h chiều" = 16:00, "4 rưỡi chiều" = 16:30, "4h45 chiều" = 16:45).
-     Nếu người dùng chỉ nói "chiều mai", "chiều nay" mà không nói giờ cụ thể: mặc định 14:00.
-   - "Tối": giờ tối = giờ + 12 (nếu nói từ 6h-11h, VD: "8h tối" = 20:00, "8 rưỡi tối" = 20:30).
-     Nếu người dùng chỉ nói "tối mai", "tối nay" mà không nói giờ cụ thể: mặc định 20:00.
-3. Ngày hẹn:
-   - "Hôm nay", "trưa nay", "chiều nay", "tối nay", "sáng nay": dùng ngày hiện tại (${currentIso.split('T')[0]}).
-   - "Mai", "trưa mai", "sáng mai", "chiều mai", "tối mai": ngày hiện tại + 1 ngày.
-     VD: "trưa mai làm báo cáo" -> ngày mai lúc 12:00:00${tzOffset}, title: "làm báo cáo".
-   - "Mốt", "ngày kia", "trưa mốt", "sáng mốt", "chiều mốt", "tối mốt": ngày hiện tại + 2 ngày.
-   - "Thứ X tuần sau": Tính đúng ngày Thứ X của tuần kế tiếp (Tuần bắt đầu từ Thứ Hai).
-4. Việc lặp lại định kỳ (recurrence_rrule):
-   - "ngày X hàng tháng" (hoặc "ngày X mỗi tháng", "mỗi tháng ngày X"):
-     + recurrence_rrule = "FREQ=MONTHLY;BYMONTHDAY=X".
-     + due_at_iso: Nếu ngày X của tháng hiện tại đã qua so với thời điểm hiện tại, lần nhắc đầu tiên PHẢI là ngày X của THÁNG KẾ TIẾP! (Nếu là tháng 12 thì sang tháng 1 năm sau). Nếu ngày X chưa tới trong tháng này, lấy ngày X của tháng này. Mặc định 09:00:00 sáng nếu không nói giờ.
-   - "mỗi ngày" / "hàng ngày": recurrence_rrule = "FREQ=DAILY".
-   - "thứ X hàng tuần" / "thứ X mỗi tuần": recurrence_rrule = "FREQ=WEEKLY;BYDAY=...".
-5. Quy tắc trường due_at_iso:
-   - BẮT BUỘC có offset múi giờ ${tzOffset} (Ví dụ: "2026-10-23T12:00:00${tzOffset}").
-   - TUYỆT ĐỐI KHÔNG dùng ký tự "Z" và KHÔNG ĐƯỢC bỏ trống phần offset.
-6. Tiêu đề (title):
-   - Chỉ giữ lại nội dung công việc cốt lõi, LOẠI BỎ các từ chỉ thời gian và lời chào/mệnh lệnh như "nhắc tôi", "nhắc mình", "trưa mai", "ngày 4 hàng tháng", "chiều nay"...
-   - Đối với intent "CREATE_TASK", trường "title" KHÔNG ĐƯỢC để trống hoặc null.
-7. Mức độ ưu tiên (priority):
-   - Nếu có từ "gấp", "quan trọng", "nhớ nhắc kỹ", "khẩn": priority = "CRITICAL", nagging_mode = true.
-   - Bình thường: priority = "MEDIUM", nagging_mode = false.
-8. Nếu người dùng muốn xem/liệt kê danh sách việc: intent = "LIST_TASKS".
-   Nếu người dùng muốn hủy/xóa việc: intent = "CANCEL_TASK".
-    `.trim();
-
-    // Prepare list of models: primary model (gemini-3.8-flash) and fallback if 404
-    const modelsToTry = [this.model];
-    if (this.model !== 'gemini-2.5-flash') {
-      modelsToTry.push('gemini-2.5-flash');
-    }
+    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset);
+    const modelsToTry = this.getCandidateModels();
 
     const startOverall = Date.now();
     let lastError: string | undefined;
@@ -158,22 +183,30 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       try {
         console.log(`[NLP-DEBUG] 🚀 Calling Gemini API (model: ${modelToUse}) for: "${text}"`);
         const startTime = Date.now();
+        // Give gemini-3.8-flash 9s to respond; fallback models 12s
+        const timeoutMs = modelToUse === 'gemini-3.8-flash' ? 9000 : 12000;
 
-        // Attempt 1: with fast thinking configuration (thinkingLevel: "LOW" on 3.x / thinkingBudget: 0 on 2.5)
-        let res = await this.requestGemini(modelToUse, text, systemPrompt, true);
+        let res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
 
-        // If HTTP 400 Bad Request, model might not support thinkingConfig. Retry without thinkingConfig.
+        // If HTTP 400 Bad Request, retry once
         if (!res.ok && res.status === 400) {
-          console.warn(`[NLP-DEBUG] ⚠️ Gemini 400 with thinkingConfig on ${modelToUse}. Retrying without thinkingConfig...`);
-          res = await this.requestGemini(modelToUse, text, systemPrompt, false);
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini 400 on ${modelToUse}. Retrying...`);
+          res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
         }
 
         const callDuration = Date.now() - startTime;
 
-        // If HTTP 404 (model ID not found), HTTP 0 (timeout), or HTTP 503 (capacity overloaded), try fallback model
-        if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 503)) {
-          lastError = res.status === 0 ? 'The operation was aborted due to timeout' : `HTTP ${res.status}: ${res.error}`;
-          console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} failed (status: ${res.status}, ${callDuration}ms). Trying fallback model...`);
+        // If HTTP 404 (not found), HTTP 0 (timeout), HTTP 429 (quota exceeded), or HTTP 503 (high demand), try fallback model
+        if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 429 || res.status === 503)) {
+          lastError =
+            res.status === 0
+              ? `The operation was aborted due to timeout (${timeoutMs}ms)`
+              : res.status === 429
+              ? `HTTP 429 Quota Exceeded (giới hạn lượt gọi model ${modelToUse})`
+              : res.status === 503
+              ? `HTTP 503 High Demand (model ${modelToUse} đang quá tải trên Google AI)`
+              : `HTTP ${res.status}: ${res.error}`;
+          console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} failed (status: ${res.status}, ${callDuration}ms: ${lastError}). Trying fallback model...`);
           continue;
         }
 
@@ -188,7 +221,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         if (!rawJson) {
           lastError = 'Gemini returned response without valid JSON payload';
           console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} returned no valid JSON part (${callDuration}ms), raw response:`, JSON.stringify(res.data));
-          break;
+          continue;
         }
 
         const parsed = JSON.parse(rawJson) as NlpExtractedTask;
@@ -204,7 +237,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       } catch (err) {
         lastError = err instanceof Error ? err.message : String(err);
         console.error(`[NLP-DEBUG] ❌ Error parsing response from Gemini model ${modelToUse}:`, err);
-        break;
+        continue;
       }
     }
 
@@ -272,37 +305,41 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       };
     }
 
-    const systemPrompt = `
-Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
-Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
-Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
-Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON theo đúng schema.
-    `.trim();
-
-    const modelsToTry = [this.model];
-    if (this.model !== 'gemini-2.5-flash') {
-      modelsToTry.push('gemini-2.5-flash');
-    }
+    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset);
+    const modelsToTry = this.getCandidateModels();
 
     let finalResult: NlpExtractedTask | null = null;
     let finalSource: 'GEMINI' | 'REGEX_FALLBACK' | 'REGEX_NO_API_KEY' = 'REGEX_FALLBACK';
 
     for (const modelToUse of modelsToTry) {
       const start = Date.now();
-      let res = await this.requestGemini(modelToUse, text, systemPrompt, true);
+      const timeoutMs = modelToUse === 'gemini-3.8-flash' ? 9000 : 12000;
+      let res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
       if (!res.ok && res.status === 400) {
-        res = await this.requestGemini(modelToUse, text, systemPrompt, false);
+        res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
       }
       const dur = Date.now() - start;
 
       const rawJson = this.extractJsonFromCandidate(res.data?.candidates?.[0]);
 
+      let errorMsg = res.error;
+      if (!res.ok) {
+        errorMsg =
+          res.status === 0
+            ? `The operation was aborted due to timeout (${timeoutMs}ms)`
+            : res.status === 429
+            ? `HTTP 429 Quota Exceeded (giới hạn 20 req/ngày trên Gemini 3.8 Free Tier)`
+            : res.status === 503
+            ? `HTTP 503 High Demand (Google AI đang quá tải)`
+            : res.error;
+      }
+
       attempts.push({
         model: modelToUse,
         status: res.status,
         durationMs: dur,
-        error: res.error,
-        rawSnippet: rawJson ? rawJson.slice(0, 300) : (res.error?.slice(0, 300) || JSON.stringify(res.data)?.slice(0, 300)),
+        error: errorMsg,
+        rawSnippet: rawJson ? rawJson.slice(0, 300) : (errorMsg?.slice(0, 300) || JSON.stringify(res.data)?.slice(0, 300)),
       });
 
       if (res.ok && rawJson) {
@@ -320,7 +357,7 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
         } catch {}
       }
 
-      if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 503)) {
+      if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 429 || res.status === 503)) {
         continue;
       }
       break;
@@ -348,32 +385,13 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
   }
 
   /**
-   * Builds the appropriate thinkingConfig based on model family.
-   * Gemini 3.x models use thinkingLevel: "LOW" to minimize reasoning latency for schema output.
-   * Gemini 2.5 models use thinkingBudget: 0 to disable thinking entirely.
-   */
-  private buildThinkingConfig(model: string): Record<string, unknown> | undefined {
-    if (model.includes('3.')) {
-      return {
-        thinkingLevel: 'LOW',
-      };
-    }
-    if (model.includes('2.5')) {
-      return {
-        thinkingBudget: 0,
-      };
-    }
-    return undefined;
-  }
-
-  /**
    * Low-level fetch wrapper for Google Gemini REST API.
    */
   private async requestGemini(
     model: string,
     text: string,
     systemPrompt: string,
-    enableFastThinking = true
+    timeoutMs = 12000
   ): Promise<{ ok: boolean; status: number; error?: string; data?: GeminiGenerateResponse }> {
     const cleanModel = model.replace(/^models\//, '');
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${encodeURIComponent(this.apiKey || '')}`;
@@ -381,15 +399,7 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
     const generationConfig: Record<string, unknown> = {
       responseMimeType: 'application/json',
       responseSchema: GEMINI_JSON_SCHEMA,
-      temperature: 0.1,
     };
-
-    if (enableFastThinking) {
-      const thinkingConfig = this.buildThinkingConfig(model);
-      if (thinkingConfig) {
-        generationConfig.thinkingConfig = thinkingConfig;
-      }
-    }
 
     const requestBody = {
       contents: [
@@ -412,7 +422,7 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
           'x-goog-api-key': this.apiKey || '',
         },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(25000), // 25s timeout ensures complete response without premature abort
+        signal: AbortSignal.timeout(timeoutMs),
       });
 
       if (!response.ok) {
@@ -761,9 +771,9 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
     // ================================================================
     const [baseY, baseM, baseD] = todayStr.split('-').map(Number);
 
-    // Check for explicit date DD/MM or ngày DD/MM(/YYYY)
+    // Check for explicit date: "ngày 20 tháng 12", "ngày 20/12", "20/12/2026", etc.
     const explicitDateMatch = lowerWithoutRemindBefore.match(
-      /(?:ngày\s+)?(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{4}))?(?!\d)/
+      /(?:ngày\s+)?(\d{1,2})\s*(?:tháng|thg|\/|\-)\s*(\d{1,2})(?:\s*(?:năm|\/|\-)\s*(\d{4}))?(?!\d)/
     );
 
     // Check for standalone weekday: "thứ 6", "thứ sáu tuần sau", "chủ nhật"
@@ -1109,8 +1119,11 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
         /(?:(?:sáng|trưa|chiều|tối)\s+)?(?:thứ\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\s*nhật)(?:\s+tuần\s+(?:sau|tới|này))?(?:\s+(?:sáng|trưa|chiều|tối))?/gi,
         ''
       )
-      // 6. Remove explicit DD/MM(/YYYY) dates
-      .replace(/(?:(?:sáng|trưa|chiều|tối)\s+)?(?:ngày\s+)?\d{1,2}[\/\-]\d{1,2}(?:[\/\-]\d{4})?(?!\d)/gi, '')
+      // 6. Remove explicit DD/MM(/YYYY) or "ngày D tháng M (năm Y)" dates
+      .replace(
+        /(?:(?:sáng|trưa|chiều|tối)\s+)?(?:ngày\s+)?\d{1,2}\s*(?:tháng|thg|\/|\-)\s*\d{1,2}(?:\s*(?:năm|\/|\-)\s*\d{4})?(?!\d)/gi,
+        ''
+      )
       // 7. Remove standalone period + date: "trưa mai", "sáng mai", "chiều nay", "tối mốt"
       .replace(/(?:sáng|trưa|chiều|tối)\s*(?:hôm\s*nay|nay|ngày\s*mai|mai|mốt|ngày\s*kia)/gi, '')
       .replace(/(?:hôm\s*nay|nay|ngày\s*mai|mai|mốt|ngày\s*kia)\s+(?:sáng|trưa|chiều|tối)/gi, '')

@@ -235,23 +235,81 @@ describe('NlpService', () => {
     expect(result.intent).toBe('CREATE_TASK');
     expect(result.title).toBe('Tập gym');
     expect(result.debug?.source).toBe('GEMINI');
-    expect(result.debug?.model).toBe('gemini-2.5-flash');
+    expect(result.debug?.model).toBe('gemini-3-flash-preview');
+  });
+
+  it('tries fallback model if primary model returns 429 Quota Exceeded', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 429,
+              message: 'Quota exceeded for metric: generativelanguage.googleapis.com/generate_content_free_tier_requests',
+              status: 'RESOURCE_EXHAUSTED',
+            },
+          }),
+          { status: 429, headers: { 'Content-Type': 'application/json' } }
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        intent: 'CREATE_TASK',
+                        title: 'Đóng tiền lãi ngân hàng',
+                        due_at_iso: '2026-12-20T09:00:00+07:00',
+                        priority: 'MEDIUM',
+                        nagging_mode: false,
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+    const apiService = new NlpService('test_gemini_api_key', 'gemini-3.8-flash');
+    const result = await apiService.parseUserPrompt('Ngày 20 tháng 12 đóng tiền lãi ngân hàng');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Đóng tiền lãi ngân hàng');
+    expect(result.due_at_iso).toBe('2026-12-20T09:00:00+07:00');
+    expect(result.debug?.source).toBe('GEMINI');
+    expect(result.debug?.model).toBe('gemini-3-flash-preview');
   });
 
   it('falls back to local regex parser when Gemini API fails on all models', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response('Service Unavailable', { status: 503 }))
-      .mockResolvedValueOnce(new Response('Service Unavailable', { status: 503 }));
+      .mockResolvedValue(new Response('Service Unavailable', { status: 503 }));
 
     const apiService = new NlpService('test_gemini_api_key');
     const result = await apiService.parseUserPrompt('trưa mai làm báo cáo tài chính');
 
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy).toHaveBeenCalled();
     expect(result.intent).toBe('CREATE_TASK');
     expect(result.title).toBe('làm báo cáo tài chính');
     expect(result.due_at_iso).toContain('T12:00:00+07:00');
     expect(result.debug?.source).toBe('REGEX_FALLBACK');
+  });
+
+  it('correctly parses "ngày 20 tháng 12" in deterministic regex fallback mode', async () => {
+    const result = await service.parseUserPrompt('Ngày 20 tháng 12 đóng tiền lãi ngân hàng');
+
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('đóng tiền lãi ngân hàng');
+    expect(result.due_at_iso).toContain('-12-20T09:00:00+07:00');
   });
 
   it('detects list tasks intent', async () => {
