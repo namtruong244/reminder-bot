@@ -7,31 +7,58 @@ import {
 } from '../utils/datetime';
 
 const GEMINI_JSON_SCHEMA = {
-  type: 'object',
+  type: 'OBJECT',
   properties: {
     intent: {
-      type: 'string',
+      type: 'STRING',
       enum: ['CREATE_TASK', 'LIST_TASKS', 'CANCEL_TASK', 'UNKNOWN'],
     },
-    title: { type: 'string' },
-    description: { type: 'string', nullable: true },
-    due_at_iso: { type: 'string', nullable: true },
-    remind_before_minutes: { type: 'integer', nullable: true },
+    title: { type: 'STRING', nullable: true },
+    description: { type: 'STRING', nullable: true },
+    due_at_iso: { type: 'STRING', nullable: true },
+    remind_before_minutes: { type: 'INTEGER', nullable: true },
     priority: {
-      type: 'string',
+      type: 'STRING',
       enum: ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'],
+      nullable: true,
     },
-    nagging_mode: { type: 'boolean' },
-    recurrence_rrule: { type: 'string', nullable: true },
+    nagging_mode: { type: 'BOOLEAN', nullable: true },
+    recurrence_rrule: { type: 'STRING', nullable: true },
   },
   required: ['intent'],
 };
 
+interface GeminiCandidatePart {
+  text?: string;
+  thought?: boolean;
+}
+
+interface GeminiCandidate {
+  content?: {
+    parts?: GeminiCandidatePart[];
+  };
+}
+
+interface GeminiGenerateResponse {
+  candidates?: GeminiCandidate[];
+  error?: {
+    code?: number;
+    message?: string;
+    status?: string;
+  };
+}
+
 export class NlpService {
+  private apiKey?: string;
+  private model: string;
+
   constructor(
-    private apiKey?: string,
-    private model: string = 'gemini-3.8-flash'
-  ) {}
+    apiKey?: string,
+    model?: string
+  ) {
+    this.apiKey = apiKey?.trim() || undefined;
+    this.model = model?.trim() || 'gemini-3.8-flash';
+  }
 
   /**
    * Parses natural language input by prioritizing Google Gemini Flash API with Structured Outputs first,
@@ -51,9 +78,9 @@ export class NlpService {
       return this.heuristicFallback(text, currentIso);
     }
 
-    // 2. PRIMARY: Call Google Gemini API with Structured Outputs first
+    // 2. PRIMARY: Call Google Gemini API with Structured Outputs
     const systemPrompt = `
-Bạn là trợ lý AI chuyên phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
+Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
 Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
 Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
 
@@ -87,12 +114,85 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    - TUYỆT ĐỐI KHÔNG dùng ký tự "Z" và KHÔNG ĐƯỢC bỏ trống phần offset.
 6. Tiêu đề (title):
    - Chỉ giữ lại nội dung công việc cốt lõi, LOẠI BỎ các từ chỉ thời gian và lời chào/mệnh lệnh như "nhắc tôi", "nhắc mình", "trưa mai", "ngày 4 hàng tháng", "chiều nay"...
+   - Đối với intent "CREATE_TASK", trường "title" KHÔNG ĐƯỢC để trống hoặc null.
 7. Mức độ ưu tiên (priority):
    - Nếu có từ "gấp", "quan trọng", "nhớ nhắc kỹ", "khẩn": priority = "CRITICAL", nagging_mode = true.
    - Bình thường: priority = "MEDIUM", nagging_mode = false.
+8. Nếu người dùng muốn xem/liệt kê danh sách việc: intent = "LIST_TASKS".
+   Nếu người dùng muốn hủy/xóa việc: intent = "CANCEL_TASK".
     `.trim();
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:generateContent?key=${this.apiKey}`;
+    // Prepare list of models: primary model (gemini-3.8-flash) and fallback if 404
+    const modelsToTry = [this.model];
+    if (this.model !== 'gemini-2.5-flash') {
+      modelsToTry.push('gemini-2.5-flash');
+    }
+
+    for (const modelToUse of modelsToTry) {
+      try {
+        // Attempt 1: with thinkingBudget: 0 (disable internal CoT for sub-second response)
+        let res = await this.requestGemini(modelToUse, text, systemPrompt, true);
+
+        // If HTTP 400 Bad Request, model might not support thinkingBudget: 0. Retry without thinkingConfig.
+        if (!res.ok && res.status === 400) {
+          console.warn(`[NLP] Gemini 400 with thinkingBudget: 0 on ${modelToUse}. Retrying without thinkingConfig...`);
+          res = await this.requestGemini(modelToUse, text, systemPrompt, false);
+        }
+
+        // If HTTP 404 (model ID not found in API version/account), try fallback model
+        if (!res.ok && res.status === 404) {
+          console.warn(`[NLP] Gemini model ${modelToUse} returned 404 Not Found. Trying fallback model...`);
+          continue;
+        }
+
+        if (!res.ok) {
+          console.error(`[NLP] Gemini API error on model ${modelToUse} (${res.status}):`, res.error);
+          break; // Stop immediately on non-404 errors (e.g. 503, 403, 429) and use regex fallback
+        }
+
+        // Extract JSON string from response candidates (handling thought parts and markdown fences)
+        const rawJson = this.extractJsonFromCandidate(res.data?.candidates?.[0]);
+        if (!rawJson) {
+          console.warn(`[NLP] Gemini model ${modelToUse} returned no valid JSON part, raw response:`, JSON.stringify(res.data));
+          break;
+        }
+
+        const parsed = JSON.parse(rawJson) as NlpExtractedTask;
+        const sanitized = this.sanitizeGeminiOutput(parsed, text, currentIso);
+        console.log(`[NLP] Successfully parsed task using Gemini API (${modelToUse}): "${sanitized.title}" [${sanitized.intent}]`);
+        return sanitized;
+      } catch (err) {
+        console.error(`[NLP] Error parsing response from Gemini model ${modelToUse}:`, err);
+        break;
+      }
+    }
+
+    console.warn(`[NLP] All Gemini calls failed or timed out. Falling back to local regex parser for: "${text}"`);
+    return this.heuristicFallback(text, currentIso);
+  }
+
+  /**
+   * Low-level fetch wrapper for Google Gemini REST API.
+   */
+  private async requestGemini(
+    model: string,
+    text: string,
+    systemPrompt: string,
+    disableThinking: boolean
+  ): Promise<{ ok: boolean; status: number; error?: string; data?: GeminiGenerateResponse }> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
+
+    const generationConfig: Record<string, unknown> = {
+      responseMimeType: 'application/json',
+      responseSchema: GEMINI_JSON_SCHEMA,
+      temperature: 0.1,
+    };
+
+    if (disableThinking) {
+      generationConfig.thinkingConfig = {
+        thinkingBudget: 0,
+      };
+    }
 
     const requestBody = {
       contents: [
@@ -104,11 +204,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       systemInstruction: {
         parts: [{ text: systemPrompt }],
       },
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: GEMINI_JSON_SCHEMA,
-        temperature: 0.1,
-      },
+      generationConfig,
     };
 
     try {
@@ -116,41 +212,139 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(4500),
+        signal: AbortSignal.timeout(12000), // 12s timeout gives ample time while preventing hanging workers
       });
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error(`Gemini API error (${response.status}):`, errorText);
-        return this.heuristicFallback(text, currentIso);
+        return { ok: false, status: response.status, error: errorText };
       }
 
-      const data = (await response.json()) as {
-        candidates?: Array<{
-          content?: {
-            parts?: Array<{ text?: string }>;
-          };
-        }>;
+      const data = (await response.json()) as GeminiGenerateResponse;
+      return { ok: true, status: response.status, data };
+    } catch (err) {
+      return {
+        ok: false,
+        status: 0,
+        error: err instanceof Error ? err.message : String(err),
       };
+    }
+  }
 
-      const rawJson = data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!rawJson) {
-        console.warn('Gemini returned empty parts, falling back to heuristic');
-        return this.heuristicFallback(text, currentIso);
+  /**
+   * Robustly extracts JSON string from a candidate's content parts.
+   * Handles cases where parts contain internal thoughts (thought: true),
+   * markdown code fences, or leading/trailing text.
+   */
+  private extractJsonFromCandidate(candidate?: GeminiCandidate): string | null {
+    const parts = candidate?.content?.parts;
+    if (!parts || parts.length === 0) return null;
+
+    // 1. Look for parts explicitly not marked as internal thought
+    const nonThoughtParts = parts.filter(
+      (p) => !p.thought && typeof p.text === 'string' && p.text.trim().length > 0
+    );
+
+    for (const part of nonThoughtParts) {
+      const extracted = this.extractJsonString(part.text!);
+      if (this.isValidJson(extracted)) {
+        return extracted;
       }
+    }
 
-      const parsed = JSON.parse(rawJson) as NlpExtractedTask;
-      if (parsed.intent === 'UNKNOWN') {
-        const fastFallback = this.fastPatternParse(text, currentIso);
-        if (fastFallback) {
-          return fastFallback;
+    // 2. Fallback: inspect all parts from last to first
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const text = parts[i]?.text;
+      if (text) {
+        const extracted = this.extractJsonString(text);
+        if (this.isValidJson(extracted)) {
+          return extracted;
         }
       }
-      return parsed;
-    } catch (err) {
-      console.error('Failed to parse with Gemini API, falling back to local parser:', err);
-      return this.heuristicFallback(text, currentIso);
     }
+
+    return null;
+  }
+
+  /**
+   * Strips markdown fences (```json ... ```) and extracts outermost JSON object { ... }.
+   */
+  private extractJsonString(raw: string): string {
+    let cleaned = raw.trim();
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    }
+    const firstBrace = cleaned.indexOf('{');
+    const lastBrace = cleaned.lastIndexOf('}');
+    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+      cleaned = cleaned.substring(firstBrace, lastBrace + 1);
+    }
+    return cleaned;
+  }
+
+  /**
+   * Checks if string is parseable JSON object.
+   */
+  private isValidJson(str: string): boolean {
+    try {
+      const parsed = JSON.parse(str);
+      return typeof parsed === 'object' && parsed !== null;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Sanitizes output parsed from Gemini to guarantee safe defaults and non-empty title.
+   */
+  private sanitizeGeminiOutput(
+    parsed: NlpExtractedTask,
+    text: string,
+    currentIso: string
+  ): NlpExtractedTask {
+    if (parsed.intent === 'UNKNOWN') {
+      const fastFallback = this.fastPatternParse(text, currentIso);
+      if (fastFallback) {
+        return fastFallback;
+      }
+      return parsed;
+    }
+
+    if (parsed.intent === 'CREATE_TASK') {
+      const isCritical = /gấp|khẩn|quan trọng|nhớ nhắc kỹ/i.test(text);
+
+      if (!parsed.title || !parsed.title.trim()) {
+        parsed.title = this.buildCleanTitle(text) || text;
+      } else {
+        parsed.title = parsed.title.trim();
+      }
+
+      if (!parsed.due_at_iso) {
+        const regexTask = this.fastPatternParse(text, currentIso);
+        if (regexTask?.due_at_iso) {
+          parsed.due_at_iso = regexTask.due_at_iso;
+          if (parsed.remind_before_minutes === undefined || parsed.remind_before_minutes === null) {
+            parsed.remind_before_minutes = regexTask.remind_before_minutes;
+          }
+        } else {
+          parsed.due_at_iso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+        }
+      }
+
+      if (!parsed.priority) {
+        parsed.priority = isCritical ? 'CRITICAL' : 'MEDIUM';
+      }
+
+      if (parsed.nagging_mode === undefined || parsed.nagging_mode === null) {
+        parsed.nagging_mode = isCritical || parsed.priority === 'CRITICAL';
+      }
+
+      if (parsed.remind_before_minutes === undefined || parsed.remind_before_minutes === null) {
+        parsed.remind_before_minutes = 0;
+      }
+    }
+
+    return parsed;
   }
 
   /**

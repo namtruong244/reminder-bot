@@ -49,6 +49,156 @@ describe('NlpService', () => {
     expect(result.remind_before_minutes).toBe(15);
   });
 
+  it('correctly handles Gemini thinking parts (thought: true) before the JSON part', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    thought: true,
+                    text: 'The user wants a reminder at 16:00. Timezone is +07:00. Priority is CRITICAL because of the word "gấp".',
+                  },
+                  {
+                    text: JSON.stringify({
+                      intent: 'CREATE_TASK',
+                      title: 'Gửi báo cáo doanh số cho ban giám đốc',
+                      description: null,
+                      due_at_iso: '2026-10-23T16:00:00+07:00',
+                      remind_before_minutes: 0,
+                      priority: 'CRITICAL',
+                      nagging_mode: true,
+                      recurrence_rrule: null,
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    const apiService = new NlpService('test_gemini_api_key');
+    const result = await apiService.parseUserPrompt('4h chiều gửi báo cáo doanh số cho ban giám đốc việc gấp');
+
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Gửi báo cáo doanh số cho ban giám đốc');
+    expect(result.priority).toBe('CRITICAL');
+    expect(result.nagging_mode).toBe(true);
+  });
+
+  it('correctly handles Gemini output wrapped in markdown code fence', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: '```json\n{\n  "intent": "CREATE_TASK",\n  "title": "Mua bánh sinh nhật",\n  "due_at_iso": "2026-10-23T18:00:00+07:00",\n  "remind_before_minutes": 15,\n  "priority": "MEDIUM",\n  "nagging_mode": false\n}\n```',
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    const apiService = new NlpService('test_gemini_api_key');
+    const result = await apiService.parseUserPrompt('Tối nay mua bánh sinh nhật');
+
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Mua bánh sinh nhật');
+    expect(result.due_at_iso).toBe('2026-10-23T18:00:00+07:00');
+  });
+
+  it('retries without thinkingConfig if Gemini returns 400 Bad Request', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response('thinkingConfig not supported', { status: 400 })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        intent: 'CREATE_TASK',
+                        title: 'Đóng tiền điện',
+                        due_at_iso: '2026-10-23T09:00:00+07:00',
+                        priority: 'MEDIUM',
+                        nagging_mode: false,
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+    const apiService = new NlpService('test_gemini_api_key');
+    const result = await apiService.parseUserPrompt('Sáng mai đóng tiền điện');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Đóng tiền điện');
+  });
+
+  it('tries fallback model if primary model returns 404 Not Found', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(
+        new Response('Model gemini-3.8-flash not found', { status: 404 })
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            candidates: [
+              {
+                content: {
+                  parts: [
+                    {
+                      text: JSON.stringify({
+                        intent: 'CREATE_TASK',
+                        title: 'Tập thể dục',
+                        due_at_iso: '2026-10-23T06:00:00+07:00',
+                        priority: 'LOW',
+                        nagging_mode: false,
+                      }),
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        )
+      );
+
+    const apiService = new NlpService('test_gemini_api_key', 'gemini-3.8-flash');
+    const result = await apiService.parseUserPrompt('Sáng mai tập thể dục');
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Tập thể dục');
+  });
+
   it('falls back to local regex parser when Gemini API fails or times out', async () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
       new Response('Service Unavailable', { status: 503 })
