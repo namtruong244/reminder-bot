@@ -56,8 +56,8 @@ export class NlpService {
     apiKey?: string,
     model?: string
   ) {
-    this.apiKey = apiKey?.trim() || undefined;
-    this.model = model?.trim() || 'gemini-3.8-flash';
+    this.apiKey = apiKey ? apiKey.trim().replace(/^["']|["']$/g, '').trim() : undefined;
+    this.model = (model?.trim() || 'gemini-3.8-flash').replace(/^models\//, '');
   }
 
   getApiKeyStatus(): { configured: boolean; preview?: string; length?: number } {
@@ -375,7 +375,8 @@ Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON the
     systemPrompt: string,
     enableFastThinking = true
   ): Promise<{ ok: boolean; status: number; error?: string; data?: GeminiGenerateResponse }> {
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${this.apiKey}`;
+    const cleanModel = model.replace(/^models\//, '');
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${cleanModel}:generateContent?key=${encodeURIComponent(this.apiKey || '')}`;
 
     const generationConfig: Record<string, unknown> = {
       responseMimeType: 'application/json',
