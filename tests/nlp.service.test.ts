@@ -308,8 +308,52 @@ describe('NlpService', () => {
     const result = await service.parseUserPrompt('Ngày 20 tháng 12 đóng tiền lãi ngân hàng');
 
     expect(result.intent).toBe('CREATE_TASK');
-    expect(result.title).toBe('đóng tiền lãi ngân hàng');
+    expect(result.title?.toLowerCase()).toBe('đóng tiền lãi ngân hàng');
     expect(result.due_at_iso).toContain('-12-20T09:00:00+07:00');
+  });
+
+  it('correctly parses "Chiều 5h về đi cắt tóc" with period before time', async () => {
+    const result = await service.parseUserPrompt('Chiều 5h về đi cắt tóc');
+
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title?.toLowerCase()).toBe('về đi cắt tóc');
+    expect(result.due_at_iso).toContain('T17:00:00+07:00');
+  });
+
+  it('sanitizes reasoning leakage and Chinese thought text from Gemini title', async () => {
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      intent: 'CREATE_TASK',
+                      title:
+                        'Về đi cắt tóc延期已过时，请注意检查日期。Due: 2026-10-23T17:00:00+07:00 -> {"intent":"CREATE_TASK","title":"Về đi cắt tóc","due_at_iso":"2026-10-23T17:00:00+07:00"}',
+                      due_at_iso: null,
+                      priority: 'MEDIUM',
+                      nagging_mode: false,
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      )
+    );
+
+    const apiService = new NlpService('test_gemini_api_key');
+    const result = await apiService.parseUserPrompt('Chiều 5h về đi cắt tóc');
+
+    expect(fetchSpy).toHaveBeenCalled();
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.title).toBe('Về đi cắt tóc');
+    expect(result.due_at_iso).toContain('T17:00:00+07:00');
   });
 
   it('detects list tasks intent', async () => {

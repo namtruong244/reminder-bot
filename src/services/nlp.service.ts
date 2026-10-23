@@ -98,13 +98,17 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    - "X phút nữa", "sau X phút", "trong X phút", "Xp nữa": due_at_iso = thời gian hiện tại + X phút, remind_before_minutes = 0.
    - "X tiếng nữa", "sau X giờ", "nửa tiếng nữa": due_at_iso = thời gian hiện tại + X tiếng (hoặc 30 phút), remind_before_minutes = 0.
 3. Thời gian theo buổi trong ngày:
-   - "Sáng": mặc định 08:00 (hoặc nếu nói giờ cụ thể, VD: "9h sáng" = 09:00, "9h30 sáng" = 09:30).
-   - "Trưa": mặc định 12:00 (hoặc "11h trưa" = 11:00, "11h30 trưa" = 11:30, "12 rưỡi trưa" = 12:30).
-   - "Chiều": giờ chiều = giờ + 12 (nếu nói từ 1h-6h, VD: "4h chiều" = 16:00, "4 rưỡi chiều" = 16:30, "4h45 chiều" = 16:45).
+   - "Sáng": mặc định 08:00 (hoặc nếu nói giờ cụ thể, VD: "9h sáng", "sáng 9h" = 09:00, "9h30 sáng" = 09:30).
+   - "Trưa": mặc định 12:00 (hoặc "11h trưa", "trưa 11h" = 11:00, "11h30 trưa", "trưa 11h30" = 11:30, "12 rưỡi trưa" = 12:30).
+   - "Chiều": giờ chiều = giờ + 12 (nếu nói từ 1h-6h, VD: "4h chiều", "chiều 4h" = 16:00, "5h chiều", "chiều 5h" = 17:00, "4 rưỡi chiều" = 16:30).
      Nếu người dùng chỉ nói "chiều mai", "chiều nay" mà không nói giờ cụ thể: mặc định 14:00.
-   - "Tối": giờ tối = giờ + 12 (nếu nói từ 6h-11h, VD: "8h tối" = 20:00, "8 rưỡi tối" = 20:30).
+   - "Tối": giờ tối = giờ + 12 (nếu nói từ 6h-11h, VD: "8h tối", "tối 8h" = 20:00, "8 rưỡi tối" = 20:30).
      Nếu người dùng chỉ nói "tối mai", "tối nay" mà không nói giờ cụ thể: mặc định 20:00.
-4. Ngày hẹn:
+4. Ngày hẹn & thời điểm trong ngày:
+   - Nếu không nói ngày nào mà chỉ nói giờ hẹn (ví dụ: "Chiều 5h...", "Tối 8h...", "9h sáng..."):
+     + Nếu giờ hẹn trong ngày hôm nay chưa qua so với thời gian hiện tại (${currentIso}): BẮT BUỘC đặt due_at_iso là ngày HÔM NAY (${currentIso.split('T')[0]}).
+       Ví dụ: Hiện tại ${currentIso}, câu "Chiều 5h về đi cắt tóc" -> due_at_iso = "${currentIso.split('T')[0]}T17:00:00${tzOffset}", title = "Về đi cắt tóc".
+     + Chỉ khi giờ hẹn hôm nay đã qua thì mới tính sang ngày mai.
    - "Hôm nay", "trưa nay", "chiều nay", "tối nay", "sáng nay": dùng ngày hiện tại (${currentIso.split('T')[0]}).
    - "Mai", "trưa mai", "sáng mai", "chiều mai", "tối mai": ngày hiện tại + 1 ngày.
      VD: "trưa mai làm báo cáo" -> ngày mai lúc 12:00:00${tzOffset}, title: "Làm báo cáo".
@@ -119,8 +123,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
 6. Quy tắc trường due_at_iso:
    - BẮT BUỘC có offset múi giờ ${tzOffset} (Ví dụ: "2026-10-23T12:00:00${tzOffset}").
    - TUYỆT ĐỐI KHÔNG dùng ký tự "Z" và KHÔNG ĐƯỢC bỏ trống phần offset.
-7. Tiêu đề (title):
-   - Chỉ giữ lại nội dung công việc cốt lõi, LOẠI BỎ các từ chỉ thời gian và lời chào/mệnh lệnh như "nhắc tôi", "nhắc mình", "ngày 20 tháng 12", "trưa mai", "ngày 4 hàng tháng", "chiều nay"...
+7. QUY ĐỊNH BẮT BUỘC CHO TIÊU ĐỀ (title):
+   - Trường "title" CHỈ CHỨA tên công việc thuần túy bằng tiếng Việt ngắn gọn (ví dụ: "Về đi cắt tóc").
+   - TUYỆT ĐỐI LOẠI BỎ mọi từ chỉ thời gian ("chiều 5h", "5h chiều", "trưa mai", "ngày 20 tháng 12", "hôm nay"...).
+   - TUYỆT ĐỐI KHÔNG giải thích, KHÔNG suy luận, KHÔNG dùng tiếng nước ngoài (tiếng Anh, tiếng Trung...), KHÔNG lồng chuỗi JSON hay ghi chú vào trường "title".
    - Đối với intent "CREATE_TASK", trường "title" KHÔNG ĐƯỢC để trống hoặc null.
 8. Mức độ ưu tiên (priority):
    - Nếu có từ "gấp", "quan trọng", "nhớ nhắc kỹ", "khẩn": priority = "CRITICAL", nagging_mode = true.
@@ -196,8 +202,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
 
         const callDuration = Date.now() - startTime;
 
-        // If HTTP 404 (not found), HTTP 0 (timeout), HTTP 429 (quota exceeded), or HTTP 503 (high demand), try fallback model
-        if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 429 || res.status === 503)) {
+        if (!res.ok) {
           lastError =
             res.status === 0
               ? `The operation was aborted due to timeout (${timeoutMs}ms)`
@@ -207,13 +212,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
               ? `HTTP 503 High Demand (model ${modelToUse} đang quá tải trên Google AI)`
               : `HTTP ${res.status}: ${res.error}`;
           console.warn(`[NLP-DEBUG] ⚠️ Gemini model ${modelToUse} failed (status: ${res.status}, ${callDuration}ms: ${lastError}). Trying fallback model...`);
+          if (res.status === 401) {
+            break; // Stop immediately only if API key itself is unauthenticated
+          }
           continue;
-        }
-
-        if (!res.ok) {
-          lastError = `HTTP ${res.status}: ${res.error}`;
-          console.error(`[NLP-DEBUG] ❌ Gemini API error on model ${modelToUse} (${res.status}, ${callDuration}ms):`, res.error);
-          break; // Stop immediately on non-recoverable errors (e.g. 401, 403 invalid key)
         }
 
         // Extract JSON string from response candidates (handling thought parts and markdown fences)
@@ -357,7 +359,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         } catch {}
       }
 
-      if (!res.ok && (res.status === 404 || res.status === 0 || res.status === 429 || res.status === 503)) {
+      if (!res.ok) {
+        if (res.status === 401) {
+          break;
+        }
         continue;
       }
       break;
@@ -529,6 +534,40 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         parsed.title = parsed.title.trim();
       }
 
+      // Detect and eliminate model reasoning leakage (e.g. Chinese thought text, nested JSON, prompt echoes)
+      const hasChinese = /[\u4e00-\u9fa5]/.test(parsed.title);
+      const hasJsonOrNotes = /->\s*\{|\{"title"|Title:|Due:|\(Note:/i.test(parsed.title);
+      if (hasChinese || hasJsonOrNotes || (parsed.title.length > 80 && text.length < 50)) {
+        console.warn(`[NLP-DEBUG] ⚠️ Detected reasoning leakage in title ("${parsed.title}"). Cleaning...`);
+        // Try to extract from nested JSON if model dumped JSON inside title
+        const innerJsonMatch = parsed.title.match(/\{[\s\S]*"title"\s*:\s*"([^"\\]+)"[\s\S]*\}/);
+        const innerDueMatch = parsed.title.match(/"due_at_iso"\s*:\s*"([^"]+)"/);
+        if (innerDueMatch && !parsed.due_at_iso) {
+          parsed.due_at_iso = innerDueMatch[1];
+        }
+
+        if (innerJsonMatch) {
+          parsed.title = innerJsonMatch[1].trim();
+        } else {
+          const titleMatch = parsed.title.match(/Title:\s*([^.\n,]+)/i);
+          if (titleMatch) {
+            parsed.title = titleMatch[1].trim();
+          } else {
+            parsed.title = this.buildCleanTitle(text) || text;
+          }
+        }
+      }
+
+      // Clean leftover time keywords from title (e.g. "Chiều 5h về đi cắt tóc" -> "về đi cắt tóc")
+      const cleanedTitle = this.buildCleanTitle(parsed.title);
+      if (cleanedTitle && cleanedTitle.length >= 2) {
+        parsed.title = cleanedTitle;
+      }
+
+      if (parsed.title) {
+        parsed.title = parsed.title.charAt(0).toUpperCase() + parsed.title.slice(1);
+      }
+
       if (!parsed.due_at_iso) {
         const regexTask = this.fastPatternParse(text, currentIso);
         if (regexTask?.due_at_iso) {
@@ -646,10 +685,15 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     const lowerWithoutRemindBefore = lower.replace(/(?:nhắc|báo)\s+trước\s+\d+\s*(?:phút|p)/g, '');
 
     // ================================================================
-    // STEP 2: Absolute time WITH period (e.g. "4h30 chiều", "4 giờ 45 chiều", "3 rưỡi sáng", "11h trưa")
+    // STEP 2: Absolute time WITH period
+    // Case A: Hour then period (e.g. "4h30 chiều", "5h chiều", "4 giờ 45 chiều", "3 rưỡi sáng", "11h trưa")
+    // Case B: Period then hour (e.g. "chiều 5h", "chiều 5h30", "chiều 5 rưỡi", "tối 8h", "sáng 7h", "trưa 11h30")
     // ================================================================
     const timeWithPeriod = lowerWithoutRemindBefore.match(
       /(\d{1,2})\s*(?:h|giờ|:)?\s*(\d{1,2})?\s*(rưỡi)?\s*(sáng|trưa|chiều|tối)/
+    );
+    const periodWithTime = lowerWithoutRemindBefore.match(
+      /\b(sáng|trưa|chiều|tối)\s+(?:lúc\s+)?(\d{1,2})\s*(?:h|giờ|:)?\s*(\d{1,2})?\s*(rưỡi)?(?!\p{L})/u
     );
 
     let targetHour: number | null = null;
@@ -670,6 +714,27 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
             targetHour = h < 12 ? h + 12 : h;
           } else if (period === 'sáng' && h === 12) {
             targetHour = 0;
+          } else {
+            targetHour = h;
+          }
+          matchedAbsoluteTime = true;
+        }
+      }
+    } else if (periodWithTime) {
+      const period = periodWithTime[1];
+      const h = parseInt(periodWithTime[2], 10);
+      if (h >= 1 && h <= 12) {
+        const capturedMin = periodWithTime[3];
+        const isRuoi = !!periodWithTime[4];
+        const parsedMin = capturedMin ? parseInt(capturedMin, 10) : isRuoi ? 30 : 0;
+        if (parsedMin >= 0 && parsedMin <= 59) {
+          targetMinute = parsedMin;
+          if (period === 'chiều' || period === 'tối') {
+            targetHour = h < 12 ? h + 12 : h;
+          } else if (period === 'sáng' && h === 12) {
+            targetHour = 0;
+          } else if (period === 'trưa' && h < 11) {
+            targetHour = h + 12;
           } else {
             targetHour = h;
           }
@@ -1080,6 +1145,25 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       }
     }
 
+    const periodWithTime = lower.match(
+      /\b(sáng|trưa|chiều|tối)\s+(?:lúc\s+)?(\d{1,2})\s*(?:h|giờ|:)?\s*(\d{1,2})?\s*(rưỡi)?(?!\p{L})/u
+    );
+    if (periodWithTime) {
+      const period = periodWithTime[1];
+      let h = parseInt(periodWithTime[2], 10);
+      if (h >= 1 && h <= 12) {
+        const minStr = periodWithTime[3];
+        const isRuoi = !!periodWithTime[4];
+        const m = minStr ? parseInt(minStr, 10) : isRuoi ? 30 : 0;
+        if (m >= 0 && m <= 59) {
+          if ((period === 'chiều' || period === 'tối') && h < 12) h += 12;
+          if (period === 'sáng' && h === 12) h = 0;
+          if (period === 'trưa' && h < 11) h += 12;
+          return { hour: h, minute: m };
+        }
+      }
+    }
+
     const time24 = lower.match(/(?:lúc\s+)?(\d{1,2})[h:](\d{1,2})?(?!\p{L})/u);
     if (time24) {
       const h = parseInt(time24[1], 10);
@@ -1112,8 +1196,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       .replace(/(?:nhắc|báo)\s+trước\s+\d+\s*(?:phút|p)/gi, '')
       // 3. Remove "nhắc tôi/mình/em"
       .replace(/nhắc\s*(?:tôi|mình|em)?\s*/gi, '')
-      // 4. Remove time + period: "4h30 chiều", "4 giờ 45 chiều", "3 rưỡi sáng", "8 giờ tối"
+      // 4A. Remove time + period: "4h30 chiều", "4 giờ 45 chiều", "3 rưỡi sáng", "8 giờ tối"
       .replace(/\d{1,2}\s*(?:h|giờ|:)?\s*\d{0,2}\s*(?:rưỡi)?\s*(?:sáng|trưa|chiều|tối)/gi, '')
+      // 4B. Remove period + time: "chiều 5h", "chiều 5h30", "chiều 5 rưỡi", "tối 8h", "sáng 7h"
+      .replace(/(?:sáng|trưa|chiều|tối)\s+(?:lúc\s+)?\d{1,2}\s*(?:h|giờ|:)?\s*\d{0,2}\s*(?:rưỡi)?(?!\p{L})/giu, '')
       // 5. Remove standalone weekday (with optional period and week modifier): "Chiều thứ 6", "thứ 6 tuần sau"
       .replace(
         /(?:(?:sáng|trưa|chiều|tối)\s+)?(?:thứ\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\s*nhật)(?:\s+tuần\s+(?:sau|tới|này))?(?:\s+(?:sáng|trưa|chiều|tối))?/gi,
