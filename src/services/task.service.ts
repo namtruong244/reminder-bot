@@ -43,22 +43,6 @@ export class TaskService {
     return fetched;
   }
 
-  async updateUserICloud(
-    telegramId: number,
-    appleId: string,
-    encryptedPassword: string,
-    calendarUrl: string
-  ): Promise<void> {
-    const query = `
-      UPDATE users
-      SET icloud_apple_id = ?,
-          icloud_app_password_enc = ?,
-          icloud_calendar_url = ?
-      WHERE telegram_id = ?;
-    `;
-    await this.db.prepare(query).bind(appleId, encryptedPassword, calendarUrl, telegramId).run();
-  }
-
   async updateUserTimezone(telegramId: number, timezone: string): Promise<void> {
     const query = `UPDATE users SET timezone = ? WHERE telegram_id = ?;`;
     await this.db.prepare(query).bind(timezone, telegramId).run();
@@ -309,13 +293,14 @@ export class TaskService {
   }
 
   /**
-   * Gets unsynced tasks for iOS Shortcuts Bridge (Adapter B), optionally scoped to a specific user_id.
+   * Gets unsynced tasks for iOS Shortcuts Bridge, optionally scoped to a specific user_id.
+   * Matches tasks where (ios_synced = 0 OR ios_synced IS NULL) AND status = 'PENDING'.
    */
-  async getUnsyncedIosTasks(limit = 20, userId?: number): Promise<TaskRecord[]> {
+  async getUnsyncedIosTasks(limit = 50, userId?: number): Promise<TaskRecord[]> {
     if (userId !== undefined && !Number.isNaN(userId)) {
       const query = `
         SELECT * FROM tasks
-        WHERE ios_synced = 0
+        WHERE (ios_synced = 0 OR ios_synced IS NULL)
           AND status = 'PENDING'
           AND user_id = ?
         ORDER BY created_at ASC
@@ -327,7 +312,7 @@ export class TaskService {
 
     const query = `
       SELECT * FROM tasks
-      WHERE ios_synced = 0
+      WHERE (ios_synced = 0 OR ios_synced IS NULL)
         AND status = 'PENDING'
       ORDER BY created_at ASC
       LIMIT ?;
@@ -337,7 +322,21 @@ export class TaskService {
   }
 
   /**
-   * Marks a task as synced with iOS.
+   * Gets count of synced tasks for a user or entire system.
+   */
+  async getSyncedIosTasksCount(userId?: number): Promise<number> {
+    if (userId !== undefined && !Number.isNaN(userId)) {
+      const query = `SELECT count(*) as count FROM tasks WHERE ios_synced = 1 AND user_id = ?;`;
+      const res = await this.db.prepare(query).bind(userId).first<{ count: number }>();
+      return res?.count || 0;
+    }
+    const query = `SELECT count(*) as count FROM tasks WHERE ios_synced = 1;`;
+    const res = await this.db.prepare(query).first<{ count: number }>();
+    return res?.count || 0;
+  }
+
+  /**
+   * Marks a single task as synced with iOS (ios_synced = 1).
    */
   async markTaskIosSynced(taskId: string, synced = 1): Promise<void> {
     const query = `UPDATE tasks SET ios_synced = ?, updated_at = datetime('now') WHERE id = ?;`;
@@ -355,19 +354,5 @@ export class TaskService {
         .bind(synced, id)
     );
     await this.db.batch(statements);
-  }
-
-  /**
-   * Updates CalDAV ETag after syncing with iCloud.
-   */
-  async updateTaskCaldavEtag(taskId: string, etag: string | null): Promise<void> {
-    const query = `
-      UPDATE tasks
-      SET caldav_etag = ?,
-          ios_synced = 1,
-          updated_at = datetime('now')
-      WHERE id = ?;
-    `;
-    await this.db.prepare(query).bind(etag, taskId).run();
   }
 }

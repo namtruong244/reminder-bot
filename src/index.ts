@@ -230,6 +230,7 @@ app.post('/api/migrate', requireAdminAuth, async (c) => {
 
     CREATE INDEX IF NOT EXISTS idx_tasks_due_scan ON tasks(status, remind_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status);
+    CREATE INDEX IF NOT EXISTS idx_tasks_ios_synced ON tasks(ios_synced, status);
   `;
 
   try {
@@ -242,26 +243,166 @@ app.post('/api/migrate', requireAdminAuth, async (c) => {
 
 // ================= ADAPTER B: iOS Shortcuts REST Bridge =================
 
-// Middleware for iOS Bridge authentication
+/**
+ * Middleware for iOS Bridge authentication.
+ * Accepts:
+ *  - Header: Authorization: Bearer <secret>
+ *  - Header: Authorization: <secret>
+ *  - Header: X-Bridge-Token: <secret> / X-API-Key: <secret>
+ *  - Query param: ?token=<secret> / ?secret=<secret> / ?key=<secret>
+ */
 const authIosBridge = async (c: Context<{ Bindings: Env }>, next: Next) => {
-  const authHeader = c.req.header('Authorization');
   const expectedSecret = c.env.IOS_BRIDGE_SECRET || c.env.ENCRYPTION_SECRET_KEY;
 
   if (!expectedSecret) {
     return c.json({ error: 'iOS Bridge secret is not configured on server' }, 500);
   }
 
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return c.json({ error: 'Missing or invalid Authorization header' }, 401);
+  const authHeader = c.req.header('Authorization');
+  const customHeader =
+    c.req.header('X-Bridge-Token') ||
+    c.req.header('X-API-Key') ||
+    c.req.header('Token');
+  const queryToken =
+    c.req.query('token') ||
+    c.req.query('secret') ||
+    c.req.query('key') ||
+    c.req.query('auth');
+
+  let providedToken: string | undefined;
+
+  if (authHeader) {
+    providedToken = authHeader.replace(/^Bearer\s+/i, '').trim();
+  } else if (customHeader) {
+    providedToken = customHeader.trim();
+  } else if (queryToken) {
+    providedToken = queryToken.trim();
   }
 
-  const token = authHeader.replace(/^Bearer\s+/, '');
-  if (token !== expectedSecret) {
-    return c.json({ error: 'Unauthorized' }, 401);
+  if (!providedToken) {
+    return c.json(
+      {
+        error:
+          'Missing authorization. Provide header "Authorization: Bearer <token>", header "X-Bridge-Token: <token>", or query parameter "?token=<token>"',
+      },
+      401
+    );
+  }
+
+  if (providedToken !== expectedSecret) {
+    return c.json({ error: 'Unauthorized: Invalid token' }, 401);
   }
 
   await next();
 };
+
+/**
+ * Safely parses any body format (JSON, Form Data, or Text) sent from iOS Shortcuts or HTTP clients.
+ */
+async function parseAnyRequestBody(c: Context<{ Bindings: Env }>): Promise<unknown> {
+  const contentType = (c.req.header('Content-Type') || '').toLowerCase();
+
+  if (contentType.includes('application/json')) {
+    try {
+      return await c.req.json();
+    } catch {
+      // Fallback below
+    }
+  }
+
+  if (
+    contentType.includes('application/x-www-form-urlencoded') ||
+    contentType.includes('multipart/form-data')
+  ) {
+    try {
+      return await c.req.parseBody();
+    } catch {
+      // Fallback below
+    }
+  }
+
+  try {
+    const rawText = (await c.req.text()).trim();
+    if (!rawText) return null;
+    if (rawText.startsWith('{') || rawText.startsWith('[')) {
+      try {
+        return JSON.parse(rawText);
+      } catch {
+        return rawText;
+      }
+    }
+    return rawText;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Robustly extracts task IDs from request body, query params, or array payloads.
+ * Handles:
+ *  - { "task_id": "abc" }
+ *  - { "task_ids": ["abc", "def"] }
+ *  - { "id": "abc" }
+ *  - { "ids": ["abc", "def"] }
+ *  - { "taskId": "abc" }
+ *  - ["abc", "def"]
+ *  - [{ "id": "abc" }, { "task_id": "def" }]
+ *  - Query params (?task_id=abc, ?id=abc, ?task_ids=abc,def)
+ *  - Raw string / newline-delimited text
+ */
+function extractTaskIds(
+  body: unknown,
+  queryParams: Record<string, string | undefined>
+): string[] {
+  const ids = new Set<string>();
+
+  const addValue = (val: unknown) => {
+    if (val === undefined || val === null) return;
+    if (typeof val === 'string') {
+      val
+        .split(/[\r\n,]+/)
+        .map((s) => s.trim().replace(/^['"]|['"]$/g, ''))
+        .filter(Boolean)
+        .forEach((id) => ids.add(id));
+    } else if (typeof val === 'number') {
+      ids.add(String(val));
+    } else if (Array.isArray(val)) {
+      for (const item of val) {
+        addValue(item);
+      }
+    } else if (typeof val === 'object') {
+      const obj = val as Record<string, unknown>;
+      const keys = ['task_id', 'taskId', 'task_ids', 'taskIds', 'id', 'ids', 'task'];
+      let matchedKnownKey = false;
+      for (const k of keys) {
+        if (obj[k] !== undefined && obj[k] !== null) {
+          addValue(obj[k]);
+          matchedKnownKey = true;
+        }
+      }
+      if (!matchedKnownKey) {
+        for (const [k, v] of Object.entries(obj)) {
+          if (
+            typeof v === 'string' &&
+            (k.toLowerCase().includes('id') || /^[0-9a-f-]{32,36}$/i.test(v))
+          ) {
+            addValue(v);
+          }
+        }
+      }
+    }
+  };
+
+  // 1. From query params
+  for (const qKey of ['task_id', 'taskId', 'id', 'task_ids', 'taskIds', 'ids']) {
+    addValue(queryParams[qKey]);
+  }
+
+  // 2. From body
+  addValue(body);
+
+  return Array.from(ids);
+}
 
 /**
  * GET /api/ios/unsynced
@@ -275,8 +416,11 @@ app.get('/api/ios/unsynced', authIosBridge, async (c) => {
     return c.json({ error: 'Invalid user_id query parameter' }, 400);
   }
 
+  const limitQuery = c.req.query('limit');
+  const limit = limitQuery ? Math.min(parseInt(limitQuery, 10) || 50, 100) : 50;
+
   const taskService = new TaskService(c.env.DB);
-  const unsynced = await taskService.getUnsyncedIosTasks(50, parsedUserId);
+  const unsynced = await taskService.getUnsyncedIosTasks(limit, parsedUserId);
   return c.json({
     count: unsynced.length,
     tasks: unsynced.map((t) => ({
@@ -285,56 +429,94 @@ app.get('/api/ios/unsynced', authIosBridge, async (c) => {
       title: t.title,
       description: t.description,
       due_at: t.due_at,
+      remind_at: t.remind_at,
       priority: t.priority,
+      recurrence_rule: t.recurrence_rule,
+      ios_synced: t.ios_synced ?? 0,
     })),
   });
 });
 
 /**
- * POST /api/ios/synced
- * Marks tasks as synced once created in iOS Reminders.
+ * Marks task(s) as synced (ios_synced = 1) in Cloudflare D1.
+ * Supports POST /api/ios/synced, POST /api/ios/sync, GET /api/ios/synced, GET /api/ios/sync
+ * Accepts single task_id, array of task_ids, or query parameter.
  */
-app.post('/api/ios/synced', authIosBridge, async (c) => {
-  let body: { task_ids?: string[] };
-  try {
-    body = await c.req.json<{ task_ids?: string[] }>();
-  } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400);
+const handleMarkSynced = async (c: Context<{ Bindings: Env }>) => {
+  let body: unknown = null;
+  if (c.req.method === 'POST') {
+    body = await parseAnyRequestBody(c);
   }
 
-  const { task_ids } = body;
-  if (!task_ids || !Array.isArray(task_ids)) {
-    return c.json({ error: 'Missing task_ids array' }, 400);
+  const queryParams = {
+    task_id: c.req.query('task_id'),
+    taskId: c.req.query('taskId'),
+    id: c.req.query('id'),
+    task_ids: c.req.query('task_ids'),
+    taskIds: c.req.query('taskIds'),
+    ids: c.req.query('ids'),
+  };
+
+  const taskIds = extractTaskIds(body, queryParams);
+
+  if (taskIds.length === 0) {
+    return c.json(
+      {
+        error:
+          'No task ID provided. Send JSON: { "task_id": "..." } or { "task_ids": [...] }, form-data, or query ?task_id=...',
+        received_body: body,
+      },
+      400
+    );
   }
 
   const taskService = new TaskService(c.env.DB);
-  await taskService.batchMarkTasksIosSynced(task_ids, 1);
+  await taskService.batchMarkTasksIosSynced(taskIds, 1);
 
-  return c.json({ success: true, synced_count: task_ids.length });
-});
+  return c.json({
+    success: true,
+    synced_count: taskIds.length,
+    updated_ids: taskIds,
+  });
+};
+
+app.post('/api/ios/synced', authIosBridge, handleMarkSynced);
+app.post('/api/ios/sync', authIosBridge, handleMarkSynced);
+app.get('/api/ios/synced', authIosBridge, handleMarkSynced);
+app.get('/api/ios/sync', authIosBridge, handleMarkSynced);
 
 /**
  * POST /api/ios/webhook
  * Receives completion events from iOS Shortcut when user marks a reminder done on iPhone.
  */
 app.post('/api/ios/webhook', authIosBridge, async (c) => {
-  let body: { task_id?: string; action?: 'COMPLETED' | 'CANCELLED' };
+  let body: any = null;
   try {
-    body = await c.req.json<{ task_id?: string; action?: 'COMPLETED' | 'CANCELLED' }>();
+    body = await parseAnyRequestBody(c);
   } catch {
-    return c.json({ error: 'Invalid JSON body' }, 400);
+    body = null;
   }
 
-  if (!body.task_id) {
-    return c.json({ error: 'Missing task_id' }, 400);
+  const taskId =
+    body?.task_id ||
+    body?.taskId ||
+    body?.id ||
+    c.req.query('task_id') ||
+    c.req.query('id');
+
+  if (!taskId) {
+    return c.json({ error: 'Missing task_id. Send { "task_id": "..." }' }, 400);
   }
 
-  if (body.action !== 'COMPLETED' && body.action !== 'CANCELLED') {
+  const rawAction = body?.action || c.req.query('action') || 'COMPLETED';
+  const action = String(rawAction).toUpperCase();
+
+  if (action !== 'COMPLETED' && action !== 'CANCELLED') {
     return c.json({ error: 'Invalid action. Expected COMPLETED or CANCELLED' }, 400);
   }
 
   const taskService = new TaskService(c.env.DB);
-  const task = await taskService.getTaskById(body.task_id);
+  const task = await taskService.getTaskById(taskId);
 
   if (!task) {
     return c.json({ error: 'Task not found' }, 404);
@@ -343,12 +525,12 @@ app.post('/api/ios/webhook', authIosBridge, async (c) => {
   const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
   const safeTitle = escapeMarkdown(task.title);
 
-  if (body.action === 'COMPLETED') {
+  if (action === 'COMPLETED') {
     if (task.recurrence_rule) {
       const user = await taskService.getUser(task.user_id);
       const tz = user?.timezone || DEFAULT_TZ;
       const next = calculateNextRecurrence(task.due_at, task.remind_at, task.recurrence_rule, tz);
-      await taskService.completeTask(body.task_id, next);
+      await taskService.completeTask(taskId, next);
 
       await telegram.sendMessage(
         task.user_id,
@@ -359,7 +541,7 @@ app.post('/api/ios/webhook', authIosBridge, async (c) => {
         { parse_mode: 'Markdown' }
       );
     } else {
-      await taskService.completeTask(body.task_id);
+      await taskService.completeTask(taskId);
 
       await telegram.sendMessage(
         task.user_id,
@@ -367,11 +549,17 @@ app.post('/api/ios/webhook', authIosBridge, async (c) => {
         { parse_mode: 'Markdown' }
       );
     }
-  } else if (body.action === 'CANCELLED') {
-    await taskService.cancelTask(body.task_id);
+  } else if (action === 'CANCELLED') {
+    await taskService.cancelTask(taskId);
+
+    await telegram.sendMessage(
+      task.user_id,
+      `📱🗑 *Đã hủy nhắc việc từ iPhone Reminders:*\n📌 ~${safeTitle}~`,
+      { parse_mode: 'Markdown' }
+    );
   }
 
-  return c.json({ success: true, task_id: body.task_id, action: body.action });
+  return c.json({ success: true, task_id: taskId, action });
 });
 
 // ================= CLOUDFLARE WORKER EXPORT =================

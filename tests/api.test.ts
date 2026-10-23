@@ -168,7 +168,7 @@ describe('Hono API Routes', () => {
     expect(body.tasks).toEqual([]);
   });
 
-  it('returns 400 on malformed JSON body in /api/ios/synced', async () => {
+  it('returns 400 on empty body without task_id in /api/ios/synced', async () => {
     const res = await app.fetch(
       new Request('http://localhost/api/ios/synced', {
         method: 'POST',
@@ -176,10 +176,111 @@ describe('Hono API Routes', () => {
           Authorization: 'Bearer ios_bearer_token',
           'Content-Type': 'application/json',
         },
-        body: '{malformed_json',
+        body: JSON.stringify({}),
       }),
       env
     );
     expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toContain('No task ID provided');
+  });
+
+  it('successfully marks task synced when receiving { task_id: "..." }', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/api/ios/synced', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ios_bearer_token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ task_id: 'task-single-uuid-123' }),
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { success: boolean; synced_count: number; updated_ids: string[] };
+    expect(data.success).toBe(true);
+    expect(data.synced_count).toBe(1);
+    expect(data.updated_ids).toContain('task-single-uuid-123');
+  });
+
+  it('successfully marks task synced when receiving { id: "..." }', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/api/ios/synced', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ios_bearer_token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ id: 'task-id-field-456' }),
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { success: boolean; synced_count: number; updated_ids: string[] };
+    expect(data.success).toBe(true);
+    expect(data.synced_count).toBe(1);
+    expect(data.updated_ids).toContain('task-id-field-456');
+  });
+
+  it('successfully marks task synced when receiving JSON array of IDs ["id1", "id2"]', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/api/ios/synced', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ios_bearer_token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(['task-arr-1', 'task-arr-2']),
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { success: boolean; synced_count: number; updated_ids: string[] };
+    expect(data.success).toBe(true);
+    expect(data.synced_count).toBe(2);
+    expect(data.updated_ids).toEqual(['task-arr-1', 'task-arr-2']);
+  });
+
+  it('successfully marks task synced with query parameter ?task_id=...', async () => {
+    const res = await app.fetch(
+      new Request('http://localhost/api/ios/synced?task_id=query-task-789', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ios_bearer_token',
+        },
+      }),
+      env
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { success: boolean; synced_count: number; updated_ids: string[] };
+    expect(data.success).toBe(true);
+    expect(data.synced_count).toBe(1);
+    expect(data.updated_ids).toContain('query-task-789');
+  });
+
+  it('supports authenticating via X-Bridge-Token header or ?token query param', async () => {
+    // Via X-Bridge-Token
+    const resHeader = await app.fetch(
+      new Request('http://localhost/api/ios/synced', {
+        method: 'POST',
+        headers: {
+          'X-Bridge-Token': 'ios_bearer_token',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ task_id: 'task-via-header' }),
+      }),
+      env
+    );
+    expect(resHeader.status).toBe(200);
+
+    // Via ?token=...
+    const resQuery = await app.fetch(
+      new Request('http://localhost/api/ios/synced?token=ios_bearer_token&task_id=task-via-token', {
+        method: 'GET',
+      }),
+      env
+    );
+    expect(resQuery.status).toBe(200);
   });
 });

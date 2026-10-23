@@ -5,7 +5,6 @@ import { TelegramApi } from './telegram';
 import { TaskService } from '../services/task.service';
 import { BotCommands } from './commands';
 import { NlpService } from '../services/nlp.service';
-import { ICloudCalDavService } from '../services/icloud.service';
 import { createTaskCreatedKeyboard } from './keyboards';
 import {
   toUtcIso,
@@ -41,14 +40,12 @@ export class TelegramWebhookHandler {
   private taskService: TaskService;
   private commands: BotCommands;
   private nlpService: NlpService;
-  private icloudService: ICloudCalDavService;
 
   constructor(private env: Env) {
     this.telegram = new TelegramApi(env.TELEGRAM_BOT_TOKEN);
     this.taskService = new TaskService(env.DB);
     this.nlpService = new NlpService(env.GEMINI_API_KEY, env.LLM_MODEL);
     this.commands = new BotCommands(env, this.telegram, this.taskService, this.nlpService);
-    this.icloudService = new ICloudCalDavService(env.ENCRYPTION_SECRET_KEY);
   }
 
   private safeWaitUntil(c: Context<{ Bindings: Env }>, promise: Promise<unknown>): void {
@@ -58,21 +55,6 @@ export class TelegramWebhookHandler {
       }
     } catch {
       // ExecutionContext is not bound in local unit tests
-    }
-  }
-
-  private async syncTaskWithICloudIfConfigured(user: UserRecord, task: TaskRecord): Promise<void> {
-    try {
-      const config = await this.icloudService.resolveUserConfig(user);
-      if (!config) return;
-      const syncResult = await this.icloudService.syncTaskToICloud(task, config);
-      if (syncResult.success) {
-        await this.taskService.updateTaskCaldavEtag(task.id, syncResult.etag || null);
-      } else {
-        console.warn(`iCloud CalDAV sync failed for task ${task.id}: ${syncResult.error}`);
-      }
-    } catch (err) {
-      console.error('Background iCloud CalDAV sync error:', err);
     }
   }
 
@@ -230,9 +212,6 @@ export class TelegramWebhookHandler {
         recurrence_rule: nlpResult.recurrence_rrule,
       });
 
-      // Push to iCloud CalDAV asynchronously if configured
-      this.safeWaitUntil(c, this.syncTaskWithICloudIfConfigured(user, createdTask));
-
       // Format confirmation response
       const priorityLabel =
         priority === 'CRITICAL' ? '🔴 KHẨN CẤP' :
@@ -254,6 +233,7 @@ export class TelegramWebhookHandler {
       if (nagging === 1) {
         confirmText += `\n⚠️ Chế độ nhắc liên tục (mỗi 10 phút) đã được kích hoạt.`;
       }
+      confirmText += `\n📱 _iOS: Đang chờ đồng bộ (ios_synced: 0)_`;
 
       if (nlpResult.debug) {
         if (nlpResult.debug.source === 'GEMINI') {
@@ -331,20 +311,14 @@ export class TelegramWebhookHandler {
       if (task.recurrence_rule) {
         // Calculate next recurrence for recurring tasks in user's timezone
         const next = calculateNextRecurrence(task.due_at, task.remind_at, task.recurrence_rule, tz);
-        const updatedTask = await this.taskService.completeTask(taskId, next);
-        if (user && updatedTask) {
-          this.safeWaitUntil(c, this.syncTaskWithICloudIfConfigured(user, updatedTask));
-        }
+        await this.taskService.completeTask(taskId, next);
 
         if (messageId) {
           const editMsg = `✅ *Đã hoàn thành lần này!*\n📌 ${safeTitle}\n⏰ Lần nhắc kế tiếp: *${formatDisplayDate(next.remindAt, tz)}*`;
           await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
         }
       } else {
-        const completedTask = await this.taskService.completeTask(taskId);
-        if (user && completedTask) {
-          this.safeWaitUntil(c, this.syncTaskWithICloudIfConfigured(user, completedTask));
-        }
+        await this.taskService.completeTask(taskId);
 
         if (messageId) {
           const editMsg = `✅ *Đã hoàn thành:* ${safeTitle} (lúc ${formatDisplayDate(new Date().toISOString(), tz)})`;
@@ -418,12 +392,6 @@ export class TelegramWebhookHandler {
       }
 
       await this.taskService.cancelTask(taskId);
-      if (user) {
-        this.safeWaitUntil(
-          c,
-          this.syncTaskWithICloudIfConfigured(user, { ...task, status: 'CANCELLED' })
-        );
-      }
 
       if (messageId) {
         const editMsg = `🗑 *Đã hủy nhắc việc:* ~${escapeMarkdown(task.title)}~`;

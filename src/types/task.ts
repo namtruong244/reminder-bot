@@ -52,18 +52,6 @@ export interface NlpExtractedTask {
   debug?: NlpDebugInfo;
 }
 
-export interface CalDavConfig {
-  appleId: string;
-  appSpecificPassword: string;
-  calendarUrl: string;
-}
-
-export interface CalDavSyncResult {
-  success: boolean;
-  etag?: string | null;
-  error?: string;
-}
-
 // Telegram Bot Types
 export interface TelegramUser {
   id: number;

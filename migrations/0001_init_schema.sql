@@ -38,3 +38,6 @@ ON tasks(status, remind_at);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_user_status
 ON tasks(user_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_ios_synced
+ON tasks(ios_synced, status);

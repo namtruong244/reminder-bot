@@ -12,7 +12,6 @@ import {
   escapeMarkdown,
   getDaysInMonth,
 } from '../src/utils/datetime';
-import { ICloudCalDavService } from '../src/services/icloud.service';
 
 describe('Crypto Utils', () => {
   const secretKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -118,28 +117,5 @@ describe('Datetime & Markdown Utils', () => {
     const raw = 'Review file_v1_final *urgent* `code` [link]';
     const escaped = escapeMarkdown(raw);
     expect(escaped).toBe('Review file\\_v1\\_final \\*urgent\\* \\`code\\` \\[link]');
-  });
-
-  it('builds valid CalDAV VTODO ICS payload', () => {
-    const caldav = new ICloudCalDavService();
-    const ics = caldav.buildVTodoIcs({
-      id: 'uuid-test-1',
-      user_id: 100,
-      title: 'Gửi hợp đồng',
-      description: 'Khách VIP',
-      due_at: '2026-10-22T08:00:00.000Z',
-      remind_at: '2026-10-22T07:45:00.000Z',
-      priority: 'CRITICAL',
-      status: 'PENDING',
-      recurrence_rule: 'FREQ=DAILY',
-      nagging_mode: 1,
-      snooze_count: 0,
-      ios_synced: 0,
-    });
-    expect(ics).toContain('BEGIN:VTODO');
-    expect(ics).toContain('UID:uuid-test-1');
-    expect(ics).toContain('DUE:20261022T080000Z');
-    expect(ics).toContain('PRIORITY:1');
-    expect(ics).toContain('RRULE:FREQ=DAILY');
   });
 });

@@ -64,10 +64,10 @@ export class BotCommands {
     const welcome = `
 👋 *Xin chào! Tôi là Trợ lý Nhắc việc Thông minh.*
 
-Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders / Calendar*:
+Tôi giúp bạn quản lý công việc và đồng bộ hai chiều với *Apple Reminders*:
 • 💬 Nhắn tự nhiên bằng tiếng Việt (VD: _"Nhắc tôi 3h chiều mai gửi hợp đồng cho khách, việc gấp"_).
 • 🔔 Tự động đẩy thông báo nhắc việc đúng giờ trên Telegram.
-• 📱 Đồng bộ hai chiều với iPhone (iCloud CalDAV hoặc Shortcuts).
+• 📱 Đồng bộ hai chiều với iPhone qua iOS Shortcuts Bridge.
 
 *Các lệnh nhanh:*
 /list - Xem danh sách việc chưa hoàn thành
@@ -92,14 +92,14 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
 2️⃣ *Quản lý:*
 • /today: Xem việc trong ngày
 • /list: Xem 20 việc sắp tới
-• /sync: Kiểm tra đồng bộ iOS
+• /sync: Kiểm tra đồng bộ iOS (ios_synced)
 • /timezone <múi_giờ>: Đổi múi giờ (mặc định: \`Asia/Ho_Chi_Minh\`)
 • /debug: Kiểm tra trạng thái AI Gemini, API Key và chẩn đoán NLP
 • /debug <câu nói>: Chạy thử nghiệm phân tích NLP với trace log chi tiết
 
-3️⃣ *Đồng bộ iOS Reminders:*
-• Các task tạo trên Telegram sẽ tự động đồng bộ qua iCloud CalDAV (nếu đã cấu hình) hoặc sẵn sàng kéo về app Lời nhắc của iPhone thông qua Phím tắt (Shortcuts).
-• Dùng lệnh /sync để xem số lượng task đang chờ kéo về iPhone.
+3️⃣ *Đồng bộ iOS Reminders (Shortcuts):*
+• Các task tạo trên Telegram sẵn sàng kéo về app Lời nhắc của iPhone thông qua Phím tắt (Shortcuts).
+• Dùng lệnh /sync để xem số lượng task đang chờ kéo về iPhone (ios_synced = 0) và đã đồng bộ (ios_synced = 1).
     `.trim();
     await this.telegram.sendMessage(chatId, help, { parse_mode: 'Markdown' });
   }
@@ -128,13 +128,13 @@ Tôi giúp bạn quản lý công việc và đồng bộ với *Apple Reminders
 
       const safeTitle = escapeMarkdown(task.title);
       const safeDesc = task.description ? escapeMarkdown(task.description) : '';
+      const syncBadge = task.ios_synced === 1 ? '🍏 iOS: Đã sync' : '⏳ iOS: Chưa sync';
 
       const text = `
 ${priorityEmoji} *${safeTitle}*
 ⏰ Hạn chót: ${formatDisplayDate(task.due_at, timezone)}
 🔔 Nhắc tiếp: ${formatDisplayDate(task.remind_at, timezone)}
-${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`` : ''}
-${safeDesc ? `📝 ${safeDesc}` : ''}
+${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}${safeDesc ? `📝 ${safeDesc}\n` : ''}📱 ${syncBadge}
       `.trim();
 
       await this.telegram.sendMessage(chatId, text, {
@@ -158,31 +158,30 @@ ${safeDesc ? `📝 ${safeDesc}` : ''}
     for (let i = 0; i < tasks.length; i++) {
       const task = tasks[i];
       const p = task.priority === 'CRITICAL' ? '🔥' : '📌';
-      message += `${i + 1}. ${p} *${escapeMarkdown(task.title)}* (${formatDisplayDate(task.due_at, timezone)})\n`;
+      const syncStatus = task.ios_synced === 1 ? '🍏' : '⏳';
+      message += `${i + 1}. ${p} *${escapeMarkdown(task.title)}* (${formatDisplayDate(task.due_at, timezone)}) [${syncStatus}]\n`;
     }
 
     await this.telegram.sendMessage(chatId, message, { parse_mode: 'Markdown' });
   }
 
   private async handleSync(chatId: number, userId: number): Promise<void> {
-    const user = await this.taskService.getUser(userId);
-    const hasICloud = !!(
-      user?.icloud_apple_id &&
-      user.icloud_app_password_enc &&
-      user.icloud_calendar_url
-    );
     const userUnsynced = await this.taskService.getUnsyncedIosTasks(100, userId);
-    const syncMode = hasICloud
-      ? 'Dual-Adapter (iCloud CalDAV + iOS Shortcuts)'
-      : 'iOS Shortcuts REST Bridge (Native Apple Reminders)';
+    const syncedCount = await this.taskService.getSyncedIosTasksCount(userId);
 
     const text = `
-📱 *TRẠNG THÁI ĐỒNG BỘ iOS REMINDERS*
-• Phương thức: ${syncMode}
-• Kết nối iCloud CalDAV: *${hasICloud ? 'Đã cấu hình ✅' : 'Chưa cấu hình'}*
-• Số task đang chờ đồng bộ về iPhone: *${userUnsynced.length}*
+📱 *TRẠNG THÁI ĐỒNG BỘ iOS REMINDERS (SHORTCUTS)*
+• Phương thức: Native Apple Reminders qua iOS Shortcuts Bridge
+• Trạng thái cột \`ios_synced\`:
+  ⏳ Đang chờ kéo về iPhone (\`ios_synced = 0\`): *${userUnsynced.length}* việc
+  ✅ Đã đồng bộ sang iPhone (\`ios_synced = 1\`): *${syncedCount}* việc
 
-💡 _Mẹo: Mở app Lời nhắc trên iPhone để Phím tắt tự động kéo task về._
+🔗 *API Endpoints cho iOS Phím tắt (Shortcuts):*
+• Kéo việc chưa đồng bộ: \`GET /api/ios/unsynced\`
+• Báo đã đồng bộ: \`POST /api/ios/synced\` (gửi \`task_id\` hoặc \`id\`)
+• Đánh dấu hoàn thành từ iOS: \`POST /api/ios/webhook\`
+
+💡 _Mẹo: Mở app Phím tắt (Shortcuts) trên iPhone để chạy automation đồng bộ._
     `.trim();
 
     await this.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown' });
