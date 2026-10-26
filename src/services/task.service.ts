@@ -198,7 +198,6 @@ export class TaskService {
             remind_at = ?,
             status = 'PENDING',
             snooze_count = 0,
-            ios_synced = 0,
             updated_at = datetime('now')
         WHERE id = ?;
       `;
@@ -252,6 +251,44 @@ export class TaskService {
     }
 
     return this.getTaskById(taskId);
+  }
+
+  /**
+   * Moves both due_at and remind_at of a pending task (user corrected the time) and
+   * re-queues it for iOS sync.
+   */
+  async rescheduleTask(taskId: string, newDueAt: string): Promise<TaskRecord | null> {
+    await this.db
+      .prepare(
+        `UPDATE tasks
+         SET due_at = ?, remind_at = ?, ios_synced = 0, updated_at = datetime('now')
+         WHERE id = ? AND status = 'PENDING';`
+      )
+      .bind(newDueAt, newDueAt, taskId)
+      .run();
+    return this.getTaskById(taskId);
+  }
+
+  /**
+   * Atomically claims a Telegram update_id. Returns false if it was already claimed
+   * (webhook retry or a parallel isolate), true if this caller should process it.
+   * PRIMARY KEY + INSERT OR IGNORE makes the claim race-free across isolates.
+   */
+  async claimTelegramUpdate(updateId: number): Promise<boolean> {
+    const res = await this.db
+      .prepare(`INSERT OR IGNORE INTO processed_updates (update_id) VALUES (?);`)
+      .bind(updateId)
+      .run();
+    return (res.meta?.changes ?? 0) > 0;
+  }
+
+  /**
+   * Drops idempotency records older than 2 days (Telegram stops retrying long before that).
+   */
+  async purgeProcessedUpdates(): Promise<void> {
+    await this.db
+      .prepare(`DELETE FROM processed_updates WHERE received_at < datetime('now', '-2 days');`)
+      .run();
   }
 
   /**
@@ -326,11 +363,11 @@ export class TaskService {
    */
   async getSyncedIosTasksCount(userId?: number): Promise<number> {
     if (userId !== undefined && !Number.isNaN(userId)) {
-      const query = `SELECT count(*) as count FROM tasks WHERE ios_synced = 1 AND user_id = ?;`;
+      const query = `SELECT count(*) as count FROM tasks WHERE ios_synced >= 1 AND user_id = ?;`;
       const res = await this.db.prepare(query).bind(userId).first<{ count: number }>();
       return res?.count || 0;
     }
-    const query = `SELECT count(*) as count FROM tasks WHERE ios_synced = 1;`;
+    const query = `SELECT count(*) as count FROM tasks WHERE ios_synced >= 1;`;
     const res = await this.db.prepare(query).first<{ count: number }>();
     return res?.count || 0;
   }
@@ -344,15 +381,36 @@ export class TaskService {
   }
 
   /**
-   * Batch marks multiple tasks as synced with iOS in a single D1 round-trip.
+   * Batch marks multiple tasks with an ios_synced state in a single D1 round-trip.
+   * Returns the ids that actually matched a row.
    */
-  async batchMarkTasksIosSynced(taskIds: string[], synced = 1): Promise<void> {
-    if (taskIds.length === 0) return;
+  async batchMarkTasksIosSynced(taskIds: string[], synced = 1): Promise<string[]> {
+    if (taskIds.length === 0) return [];
     const statements = taskIds.map((id) =>
       this.db
         .prepare(`UPDATE tasks SET ios_synced = ?, updated_at = datetime('now') WHERE id = ?;`)
         .bind(synced, id)
     );
-    await this.db.batch(statements);
+    const results = await this.db.batch(statements);
+    return taskIds.filter((_, i) => (results[i]?.meta?.changes ?? 0) > 0);
+  }
+
+  /**
+   * Gets non-PENDING tasks whose reminder is still open on the iPhone (ios_synced = 1).
+   */
+  async getIosClosedTasks(limit = 100, userId?: number): Promise<TaskRecord[]> {
+    const hasUser = userId !== undefined && !Number.isNaN(userId);
+    const query = `
+      SELECT * FROM tasks
+      WHERE ios_synced = 1
+        AND status IN ('COMPLETED', 'CANCELLED')
+        ${hasUser ? 'AND user_id = ?' : ''}
+      ORDER BY updated_at ASC
+      LIMIT ?;
+    `;
+    const stmt = this.db.prepare(query);
+    const bound = hasUser ? stmt.bind(userId, limit) : stmt.bind(limit);
+    const { results } = await bound.all<TaskRecord>();
+    return results || [];
   }
 }

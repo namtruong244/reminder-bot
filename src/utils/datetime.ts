@@ -298,8 +298,8 @@ export function calculateNextRecurrence(
   const byMonthDayMatch = upperRRule.match(/BYMONTHDAY=(\d+)/);
   const byMonthDay = byMonthDayMatch ? parseInt(byMonthDayMatch[1], 10) : null;
 
-  const byDayMatch = upperRRule.match(/BYDAY=([A-Z]{2})/);
-  const byDay = byDayMatch ? byDayMatch[1] : null;
+  const byDayMatch = upperRRule.match(/BYDAY=([A-Z]{2}(?:,[A-Z]{2})*)/);
+  const byDays = byDayMatch ? byDayMatch[1].split(',') : [];
 
   const initialParts = getLocalDateParts(dueDate, timezone);
   let curYear = initialParts.year;
@@ -331,13 +331,18 @@ export function calculateNextRecurrence(
       curMonth = next.getUTCMonth() + 1;
       curDay = next.getUTCDate();
     } else if (freq === 'WEEKLY') {
-      if (byDay) {
+      if (byDays.length > 0) {
         const dayMap: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
-        const targetWeekday = dayMap[byDay] ?? 1;
         const curUtc = new Date(Date.UTC(curYear, curMonth - 1, curDay));
         const currentWeekday = curUtc.getUTCDay();
-        let daysToAdd = (targetWeekday - currentWeekday + 7) % 7;
-        if (daysToAdd === 0) daysToAdd = 7 * interval;
+        // Nearest following listed weekday; wrapping onto the same weekday jumps whole interval(s)
+        let daysToAdd = Infinity;
+        for (const code of byDays) {
+          const target = dayMap[code] ?? 1;
+          let delta = (target - currentWeekday + 7) % 7;
+          if (delta === 0) delta = 7 * interval;
+          daysToAdd = Math.min(daysToAdd, delta);
+        }
         const next = new Date(Date.UTC(curYear, curMonth - 1, curDay + daysToAdd));
         curYear = next.getUTCFullYear();
         curMonth = next.getUTCMonth() + 1;

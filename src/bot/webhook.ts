@@ -12,6 +12,8 @@ import {
   formatDisplayDate,
   calculateNextRecurrence,
   getTomorrowMorningIso,
+  getLocalDateParts,
+  getTimezoneOffsetString,
   escapeMarkdown,
   DEFAULT_TZ,
 } from '../utils/datetime';
@@ -76,22 +78,52 @@ export class TelegramWebhookHandler {
       return c.text('Invalid JSON', 400);
     }
 
-    // Idempotency guard against duplicate Telegram webhook retries
-    if (typeof update.update_id === 'number' && !markUpdateProcessed(update.update_id)) {
+    // Idempotency guard against duplicate Telegram webhook retries (shared across isolates via D1)
+    if (typeof update.update_id === 'number' && !(await this.claimUpdate(update.update_id))) {
       return c.text('OK', 200);
     }
 
+    // Acknowledge immediately: NLP (Gemini) can take several seconds and Telegram retries slow webhooks.
+    await this.runInBackground(c, this.processUpdate(c, update));
+    return c.text('OK', 200);
+  }
+
+  /**
+   * Claims the update_id in D1. If D1 is unavailable (e.g. migration 0002 not applied yet),
+   * degrade to the per-isolate in-memory guard instead of dropping the update.
+   */
+  private async claimUpdate(updateId: number): Promise<boolean> {
     try {
-      // 2. Handle Message
+      return await this.taskService.claimTelegramUpdate(updateId);
+    } catch (err) {
+      console.warn('processed_updates claim failed, using in-memory guard:', err);
+      return markUpdateProcessed(updateId);
+    }
+  }
+
+  /**
+   * Runs work after the HTTP response via ctx.waitUntil; without an ExecutionContext
+   * (unit tests, local scripts) it is awaited inline so nothing is silently dropped.
+   */
+  private async runInBackground(c: Context<{ Bindings: Env }>, work: Promise<unknown>): Promise<void> {
+    let scheduled = false;
+    try {
+      if (c.executionCtx && typeof c.executionCtx.waitUntil === 'function') {
+        c.executionCtx.waitUntil(work);
+        scheduled = true;
+      }
+    } catch {
+      // ExecutionContext is not bound
+    }
+    if (!scheduled) await work;
+  }
+
+  private async processUpdate(c: Context<{ Bindings: Env }>, update: TelegramUpdate): Promise<void> {
+    try {
       if (update.message) {
         await this.handleMessage(c, update.message);
-        return c.text('OK', 200);
-      }
-
-      // 3. Handle Callback Query (Inline Keyboard Buttons)
-      if (update.callback_query) {
+      } else if (update.callback_query) {
         await this.handleCallbackQuery(c, update.callback_query);
-        return c.text('OK', 200);
       }
     } catch (err) {
       console.error('Unhandled error in Telegram webhook handler:', err);
@@ -108,10 +140,7 @@ export class TelegramWebhookHandler {
           // Ignore secondary send failures
         }
       }
-      return c.text(`Internal Handled Error: ${errorMsg}`, 200);
     }
-
-    return c.text('OK', 200);
   }
 
   private async handleMessage(
@@ -154,7 +183,8 @@ export class TelegramWebhookHandler {
     const nlpResult = await this.nlpService.parseUserPrompt(text, tz);
 
     if (nlpResult.intent === 'LIST_TASKS') {
-      const listCmdMsg = { ...message, text: '/list' };
+      const wantsToday = /hôm\s+nay|today/i.test(text);
+      const listCmdMsg = { ...message, text: wantsToday ? '/today' : '/list' };
       await this.commands.handleCommand(listCmdMsg);
       return;
     }
@@ -184,6 +214,16 @@ export class TelegramWebhookHandler {
       // Calculate remind_at intelligently
       const nowMs = Date.now();
       const dueMs = new Date(dueAtUtc).getTime();
+
+      // Refuse times that are already past (model/regex error or stale date) instead of firing instantly
+      if (dueMs < nowMs - 60_000) {
+        await this.telegram.sendMessage(
+          chatId,
+          `⚠️ Thời điểm tôi hiểu được là *${formatDisplayDate(dueAtUtc, tz)}* — đã qua rồi. Bạn nhắn lại kèm ngày giờ cụ thể giúp tôi nhé (ví dụ: _"9h sáng mai ..."_).`,
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
       const diffMinutes = Math.round((dueMs - nowMs) / 60000);
 
       // If user scheduled something soon (<= 30 mins) or remindBefore would be in the past, ring exactly on time
@@ -233,6 +273,9 @@ export class TelegramWebhookHandler {
       if (nagging === 1) {
         confirmText += `\n⚠️ Chế độ nhắc liên tục (mỗi 10 phút) đã được kích hoạt.`;
       }
+      if (nlpResult.time_assumed) {
+        confirmText += `\n\n❓ _Tin nhắn chưa nói rõ giờ nên tôi tạm đặt sau 30 phút. Bấm nút bên dưới để chỉnh nhanh._`;
+      }
       confirmText += `\n📱 _iOS: Đang chờ đồng bộ (ios_synced: 0)_`;
 
       if (nlpResult.debug) {
@@ -247,7 +290,7 @@ export class TelegramWebhookHandler {
 
       await this.telegram.sendMessage(chatId, confirmText, {
         parse_mode: 'Markdown',
-        reply_markup: createTaskCreatedKeyboard(taskId),
+        reply_markup: createTaskCreatedKeyboard(taskId, !!nlpResult.time_assumed),
       });
       return;
     }
@@ -370,6 +413,50 @@ export class TelegramWebhookHandler {
       }
 
       await this.telegram.answerCallbackQuery(query.id, `Đã hoãn ${snoozeNote}`);
+      return;
+    }
+
+    if (subAction === 'resched') {
+      // Format: action:resched:{1h|tonight|tomorrow}:{taskId}
+      const taskId = parts[3];
+      const task = await this.taskService.getTaskById(taskId);
+
+      if (!task) {
+        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
+        return;
+      }
+      if (task.user_id !== query.from.id) {
+        await this.telegram.answerCallbackQuery(query.id, 'Bạn không có quyền thao tác trên công việc này!', true);
+        return;
+      }
+      if (task.status !== 'PENDING') {
+        await this.telegram.answerCallbackQuery(query.id, 'Công việc đã đóng, không thể đổi giờ.');
+        return;
+      }
+
+      let newDue: string;
+      if (paramId === 'tomorrow') {
+        newDue = getTomorrowMorningIso(tz, 9, 0);
+      } else if (paramId === 'tonight') {
+        const today = getLocalDateParts(new Date(), tz);
+        const iso = `${today.year}-${String(today.month).padStart(2, '0')}-${String(today.day).padStart(2, '0')}T20:00:00${getTimezoneOffsetString(new Date(), tz)}`;
+        newDue = toUtcIso(iso, tz);
+        // 20:00 already gone -> next evening
+        if (new Date(newDue).getTime() <= Date.now()) newDue = addMinutes(newDue, 24 * 60);
+      } else {
+        newDue = addMinutes(new Date(), 60);
+      }
+
+      await this.taskService.rescheduleTask(taskId, newDue);
+
+      if (messageId) {
+        const editMsg = `✏️ *Đã đổi giờ nhắc*\n📌 *${escapeMarkdown(task.title)}*\n⏰ Hạn chót mới: *${formatDisplayDate(newDue, tz)}*`;
+        await this.telegram.editMessageText(chatId, messageId, editMsg, {
+          parse_mode: 'Markdown',
+          reply_markup: createTaskCreatedKeyboard(taskId),
+        });
+      }
+      await this.telegram.answerCallbackQuery(query.id, 'Đã cập nhật giờ!');
       return;
     }
 

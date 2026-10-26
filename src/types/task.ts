@@ -49,6 +49,8 @@ export interface NlpExtractedTask {
   priority?: TaskPriority | null;
   nagging_mode?: boolean | null;
   recurrence_rrule?: string | null;
+  /** True when the message carried no time info and a default due time was substituted. */
+  time_assumed?: boolean;
   debug?: NlpDebugInfo;
 }
 

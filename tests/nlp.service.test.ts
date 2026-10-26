@@ -121,7 +121,7 @@ describe('NlpService', () => {
     expect(result.due_at_iso).toBe('2026-10-23T18:00:00+07:00');
   });
 
-  it('retries without thinkingConfig if Gemini returns 400 Bad Request', async () => {
+  it('falls through to the next model if Gemini returns 400 Bad Request', async () => {
     const fetchSpy = vi
       .spyOn(globalThis, 'fetch')
       .mockResolvedValueOnce(

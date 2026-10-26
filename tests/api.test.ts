@@ -39,7 +39,9 @@ function createMockD1(): D1Database {
 
   const mockDb = {
     prepare: (_query: string) => mockStatement,
-    batch: async <T>() => [] as D1Result<T>[],
+    // Every statement in a batch reports one changed row, like a successful UPDATE
+    batch: async <T>(statements: unknown[]) =>
+      statements.map(() => ({ results: [], success: true, meta: { changes: 1 } })) as unknown as D1Result<T>[],
     exec: async (_query: string) => ({ count: 0, duration: 0 }),
     dump: async () => new ArrayBuffer(0),
   };
@@ -110,7 +112,7 @@ describe('Hono API Routes', () => {
     };
     expect(data.status).toBe('ok');
     expect(data.gemini.api_key_configured).toBe(false);
-    expect(data.gemini.model).toBe('gemini-3.8-flash');
+    expect(data.gemini.model).toBe('gemini-3.5-flash');
     expect(data.database.healthy).toBe(true);
   });
 
@@ -259,7 +261,7 @@ describe('Hono API Routes', () => {
     expect(data.updated_ids).toContain('query-task-789');
   });
 
-  it('supports authenticating via X-Bridge-Token header or ?token query param', async () => {
+  it('authenticates via X-Bridge-Token header but rejects the secret in a query string', async () => {
     // Via X-Bridge-Token
     const resHeader = await app.fetch(
       new Request('http://localhost/api/ios/synced', {
@@ -274,13 +276,21 @@ describe('Hono API Routes', () => {
     );
     expect(resHeader.status).toBe(200);
 
-    // Via ?token=...
+    // Secrets in URLs end up in logs, so ?token=... must not authenticate
     const resQuery = await app.fetch(
-      new Request('http://localhost/api/ios/synced?token=ios_bearer_token&task_id=task-via-token', {
+      new Request('http://localhost/api/ios/unsynced?token=ios_bearer_token', { method: 'GET' }),
+      env
+    );
+    expect(resQuery.status).toBe(401);
+
+    // State-changing endpoint is POST-only
+    const resGet = await app.fetch(
+      new Request('http://localhost/api/ios/synced?task_id=x', {
         method: 'GET',
+        headers: { Authorization: 'Bearer ios_bearer_token' },
       }),
       env
     );
-    expect(resQuery.status).toBe(200);
+    expect(resGet.status).toBe(404);
   });
 });

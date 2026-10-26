@@ -3,15 +3,24 @@ import { TelegramInlineKeyboardMarkup } from '../types/task';
 /**
  * Keyboard attached when a new task is created.
  */
-export function createTaskCreatedKeyboard(taskId: string): TelegramInlineKeyboardMarkup {
-  return {
-    inline_keyboard: [
-      [
-        { text: '✅ Hoàn thành ngay', callback_data: `action:done:${taskId}` },
-        { text: '🗑 Hủy nhắc nhở', callback_data: `action:cancel:${taskId}` },
-      ],
-    ],
-  };
+export function createTaskCreatedKeyboard(
+  taskId: string,
+  timeAssumed = false
+): TelegramInlineKeyboardMarkup {
+  const rows: TelegramInlineKeyboardMarkup['inline_keyboard'] = [];
+  if (timeAssumed) {
+    // The bot had to guess the time, so offer one-tap corrections
+    rows.push([
+      { text: '⏰ +1 giờ', callback_data: `action:resched:1h:${taskId}` },
+      { text: '🌙 Tối nay 20h', callback_data: `action:resched:tonight:${taskId}` },
+      { text: '📅 Mai 9h', callback_data: `action:resched:tomorrow:${taskId}` },
+    ]);
+  }
+  rows.push([
+    { text: '✅ Hoàn thành ngay', callback_data: `action:done:${taskId}` },
+    { text: '🗑 Hủy nhắc nhở', callback_data: `action:cancel:${taskId}` },
+  ]);
+  return { inline_keyboard: rows };
 }
 
 /**

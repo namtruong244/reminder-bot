@@ -3,6 +3,8 @@ import {
   getNowWithTimezone,
   getVietnameseDayOfWeek,
   getDaysInMonth,
+  getLocalDateParts,
+  calculateNextRecurrence,
   DEFAULT_TZ,
 } from '../utils/datetime';
 
@@ -27,6 +29,33 @@ const GEMINI_JSON_SCHEMA = {
   },
   required: ['intent'],
 };
+
+// Kinship/title words that precede a given name, so "anh Mai" is not read as "tomorrow".
+const NAME_PREFIX = '(?<!anh |chị |em |cô |chú |bác |dì |cậu |ông |bà |bạn |thầy |bé )';
+
+// "gấp" only counts as urgency in an urgency context ("việc gấp", ", gấp", "gấp nhé", trailing),
+// never as a verb ("gấp quần áo").
+const CRITICAL_SRC =
+  'việc\\s+gấp|(?:^|[\\s,;])gấp\\s*(?:nhé|nha|lắm|ạ)?\\s*[.!]*$|\\bgấp\\s+(?:nhé|nha|lắm)\\b|khẩn(?:\\s*cấp)?|quan\\s+trọng|nhớ\\s+nhắc\\s+kỹ';
+const CRITICAL_RE = new RegExp(CRITICAL_SRC, 'i');
+const CRITICAL_STRIP_RE = new RegExp(CRITICAL_SRC, 'gi');
+
+const WEEKDAY_SRC = 'thứ\\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\\s*nhật';
+
+const VALID_RRULE_RE = /^FREQ=(?:DAILY|WEEKLY|MONTHLY|YEARLY)(?:;[A-Z]+=[A-Z0-9,+-]+)*$/;
+
+const NLP_TOTAL_BUDGET_MS = 20000;
+const NLP_MODEL_TIMEOUT_MS = 12000;
+
+const L = '(?<!\\p{L})';
+const R = '(?!\\p{L})';
+const DAY_AFTER_RE = new RegExp(`${L}${NAME_PREFIX}(?:mốt|ngày\\s+kia)${R}`, 'u');
+const TOMORROW_RE = new RegExp(`${L}${NAME_PREFIX}mai${R}`, 'u');
+const TODAY_RE = new RegExp(`${L}(?:hôm\\s+nay|nay)${R}`, 'u');
+
+// Detects time phrases left behind in a model-provided title, so we only clean when needed.
+const TIME_RESIDUE_RE =
+  /\d{1,2}\s*(?:h|giờ|:)\s*\d{0,2}|(?:sáng|trưa|chiều|tối)\s+(?:nay|mai|mốt|\d)|\d\s*(?:sáng|trưa|chiều|tối)|hôm nay|ngày mai|\d{1,2}\/\d{1,2}|(?:sau|trong)\s+\d+|\d+\s*(?:phút|tiếng|ngày)\s+nữa|(?:hàng|mỗi)\s+(?:ngày|tuần|tháng)/i;
 
 interface GeminiCandidatePart {
   text?: string;
@@ -57,7 +86,7 @@ export class NlpService {
     model?: string
   ) {
     this.apiKey = apiKey ? apiKey.trim().replace(/^["']|["']$/g, '').trim() : undefined;
-    this.model = (model?.trim() || 'gemini-3.8-flash').replace(/^models\//, '');
+    this.model = (model?.trim() || 'gemini-3.5-flash').replace(/^models\//, '');
   }
 
   getApiKeyStatus(): { configured: boolean; preview?: string; length?: number } {
@@ -80,12 +109,17 @@ export class NlpService {
     currentIso: string,
     dayOfWeek: string,
     timezone: string,
-    tzOffset: string
+    tzOffset: string,
+    now: Date = new Date()
   ): string {
+    const calendar = this.buildCalendarTable(now, timezone);
     return `
 Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
 Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
 Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
+
+Lịch 15 ngày tới (dùng bảng này để suy ra ngày, KHÔNG tự tính thứ):
+${calendar}
 
 Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON theo đúng schema.
 
@@ -113,27 +147,50 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    - "Mai", "trưa mai", "sáng mai", "chiều mai", "tối mai": ngày hiện tại + 1 ngày.
      VD: "trưa mai làm báo cáo" -> ngày mai lúc 12:00:00${tzOffset}, title: "Làm báo cáo".
    - "Mốt", "ngày kia", "trưa mốt", "sáng mốt", "chiều mốt", "tối mốt": ngày hiện tại + 2 ngày.
-   - "Thứ X tuần sau": Tính đúng ngày Thứ X của tuần kế tiếp (Tuần bắt đầu từ Thứ Hai).
+   - "Thứ X tuần sau": Tính đúng ngày Thứ X của tuần kế tiếp (Tuần bắt đầu từ Thứ Hai). "Thứ X" không kèm "tuần sau": ngày Thứ X gần nhất sắp tới.
+   - "X ngày nữa", "sau X ngày": ngày hiện tại + X ngày. "Đầu tuần sau": Thứ Hai tuần sau. "Cuối tuần": Thứ Bảy gần nhất. "Cuối tháng": ngày cuối cùng của tháng hiện tại.
+   - Giờ "kém": "9h kém 15" = 08:45. "Rưỡi" = :30. "Khuya"/"đêm": 23:00 nếu không nói giờ.
+   - Nếu chỉ nói ngày mà không nói giờ: mặc định 09:00:00.
+   - Nếu hoàn toàn không có thông tin thời gian: để due_at_iso = null (KHÔNG tự bịa giờ).
+   - "Mai", "mốt", "nay" đứng sau từ chỉ người (anh Mai, chị Nay) là TÊN RIÊNG, không phải ngày.
 5. Việc lặp lại định kỳ (recurrence_rrule):
    - "ngày X hàng tháng" (hoặc "ngày X mỗi tháng", "mỗi tháng ngày X"):
      + recurrence_rrule = "FREQ=MONTHLY;BYMONTHDAY=X".
      + due_at_iso: Nếu ngày X của tháng hiện tại đã qua so với thời điểm hiện tại, lần nhắc đầu tiên PHẢI là ngày X của THÁNG KẾ TIẾP! (Nếu là tháng 12 thì sang tháng 1 năm sau). Nếu ngày X chưa tới trong tháng này, lấy ngày X của tháng này. Mặc định 09:00:00 sáng nếu không nói giờ.
    - "mỗi ngày" / "hàng ngày": recurrence_rrule = "FREQ=DAILY".
-   - "thứ X hàng tuần" / "thứ X mỗi tuần": recurrence_rrule = "FREQ=WEEKLY;BYDAY=...".
+   - "thứ X hàng tuần" / "thứ X mỗi tuần": recurrence_rrule = "FREQ=WEEKLY;BYDAY=..." (nhiều thứ thì nối bằng dấu phẩy: "thứ 2 và thứ 4 hàng tuần" -> BYDAY=MO,WE).
+   - due_at_iso của việc lặp là lần xuất hiện ĐẦU TIÊN trong tương lai.
 6. Quy tắc trường due_at_iso:
    - BẮT BUỘC có offset múi giờ ${tzOffset} (Ví dụ: "2026-10-23T12:00:00${tzOffset}").
    - TUYỆT ĐỐI KHÔNG dùng ký tự "Z" và KHÔNG ĐƯỢC bỏ trống phần offset.
 7. QUY ĐỊNH BẮT BUỘC CHO TIÊU ĐỀ (title):
    - Trường "title" CHỈ CHỨA tên công việc thuần túy bằng tiếng Việt ngắn gọn (ví dụ: "Về đi cắt tóc").
-   - TUYỆT ĐỐI LOẠI BỎ mọi từ chỉ thời gian ("chiều 5h", "5h chiều", "trưa mai", "ngày 20 tháng 12", "hôm nay"...).
+   - TUYỆT ĐỐI LOẠI BỎ mọi từ chỉ thời gian ("chiều 5h", "5h chiều", "trưa mai", "ngày 20 tháng 12", "hôm nay"...) và từ "nhắc tôi". GIỮ NGUYÊN số lượng và tên riêng (VD: "mua 2 hộp sữa", "gọi anh Mai", "họp 2 phòng ban").
    - TUYỆT ĐỐI KHÔNG giải thích, KHÔNG suy luận, KHÔNG dùng tiếng nước ngoài (tiếng Anh, tiếng Trung...), KHÔNG lồng chuỗi JSON hay ghi chú vào trường "title".
    - Đối với intent "CREATE_TASK", trường "title" KHÔNG ĐƯỢC để trống hoặc null.
 8. Mức độ ưu tiên (priority):
-   - Nếu có từ "gấp", "quan trọng", "nhớ nhắc kỹ", "khẩn": priority = "CRITICAL", nagging_mode = true.
+   - Nếu người dùng nhấn mạnh sự khẩn cấp ("việc gấp", "gấp nhé", "quan trọng", "nhớ nhắc kỹ", "khẩn"): priority = "CRITICAL", nagging_mode = true.
+   - "gấp" là động từ (gấp quần áo, gấp giấy) thì KHÔNG phải khẩn cấp, và vẫn phải giữ trong title.
    - Bình thường: priority = "MEDIUM", nagging_mode = false.
 9. Nếu người dùng muốn xem/liệt kê danh sách việc: intent = "LIST_TASKS".
    Nếu người dùng muốn hủy/xóa việc: intent = "CANCEL_TASK".
 `.trim();
+  }
+
+  /**
+   * Builds a 15-day lookup table so the model never has to compute weekdays itself.
+   */
+  private buildCalendarTable(now: Date, timezone: string): string {
+    const rows: string[] = [];
+    const labels = ['Hôm nay', 'Ngày mai', 'Ngày mốt'];
+    for (let i = 0; i < 15; i++) {
+      const d = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
+      const p = getLocalDateParts(d, timezone);
+      const iso = `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
+      const label = labels[i] ? ` (${labels[i]})` : '';
+      rows.push(`- ${iso}: ${getVietnameseDayOfWeek(d, timezone)}${label}`);
+    }
+    return rows.join('\n');
   }
 
   /**
@@ -179,26 +236,24 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     }
 
     // 2. PRIMARY: Call Google Gemini API with Structured Outputs
-    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset);
+    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset, now);
     const modelsToTry = this.getCandidateModels();
 
     const startOverall = Date.now();
     let lastError: string | undefined;
 
     for (const modelToUse of modelsToTry) {
+      // Total NLP budget: Telegram retries webhooks that take too long, which would create duplicate tasks
+      if (modelToUse !== modelsToTry[0] && Date.now() - startOverall > NLP_TOTAL_BUDGET_MS) {
+        lastError = `${lastError ?? 'Gemini slow'} (đã vượt ${NLP_TOTAL_BUDGET_MS / 1000}s tổng thời gian chờ)`;
+        break;
+      }
       try {
         console.log(`[NLP-DEBUG] 🚀 Calling Gemini API (model: ${modelToUse}) for: "${text}"`);
         const startTime = Date.now();
-        // Give gemini-3.8-flash 9s to respond; fallback models 12s
-        const timeoutMs = modelToUse === 'gemini-3.8-flash' ? 9000 : 12000;
+        const timeoutMs = NLP_MODEL_TIMEOUT_MS;
 
-        let res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
-
-        // If HTTP 400 Bad Request, retry once
-        if (!res.ok && res.status === 400) {
-          console.warn(`[NLP-DEBUG] ⚠️ Gemini 400 on ${modelToUse}. Retrying...`);
-          res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
-        }
+        const res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
 
         const callDuration = Date.now() - startTime;
 
@@ -227,7 +282,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         }
 
         const parsed = JSON.parse(rawJson) as NlpExtractedTask;
-        const sanitized = this.sanitizeGeminiOutput(parsed, text, currentIso);
+        const sanitized = this.sanitizeGeminiOutput(parsed, text, currentIso, timezone);
         sanitized.debug = {
           source: 'GEMINI',
           model: modelToUse,
@@ -307,7 +362,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       };
     }
 
-    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset);
+    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset, now);
     const modelsToTry = this.getCandidateModels();
 
     let finalResult: NlpExtractedTask | null = null;
@@ -315,11 +370,8 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
 
     for (const modelToUse of modelsToTry) {
       const start = Date.now();
-      const timeoutMs = modelToUse === 'gemini-3.8-flash' ? 9000 : 12000;
-      let res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
-      if (!res.ok && res.status === 400) {
-        res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
-      }
+      const timeoutMs = NLP_MODEL_TIMEOUT_MS;
+      const res = await this.requestGemini(modelToUse, text, systemPrompt, timeoutMs);
       const dur = Date.now() - start;
 
       const rawJson = this.extractJsonFromCandidate(res.data?.candidates?.[0]);
@@ -330,7 +382,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
           res.status === 0
             ? `The operation was aborted due to timeout (${timeoutMs}ms)`
             : res.status === 429
-            ? `HTTP 429 Quota Exceeded (giới hạn 20 req/ngày trên Gemini 3.8 Free Tier)`
+            ? `HTTP 429 Quota Exceeded (hết quota free tier của model này)`
             : res.status === 503
             ? `HTTP 503 High Demand (Google AI đang quá tải)`
             : res.error;
@@ -347,7 +399,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       if (res.ok && rawJson) {
         try {
           const parsed = JSON.parse(rawJson) as NlpExtractedTask;
-          finalResult = this.sanitizeGeminiOutput(parsed, text, currentIso);
+          finalResult = this.sanitizeGeminiOutput(parsed, text, currentIso, timezone);
           finalResult.debug = {
             source: 'GEMINI',
             model: modelToUse,
@@ -404,6 +456,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     const generationConfig: Record<string, unknown> = {
       responseMimeType: 'application/json',
       responseSchema: GEMINI_JSON_SCHEMA,
+      temperature: 0,
     };
 
     const requestBody = {
@@ -515,7 +568,8 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
   private sanitizeGeminiOutput(
     parsed: NlpExtractedTask,
     text: string,
-    currentIso: string
+    currentIso: string,
+    timezone: string = DEFAULT_TZ
   ): NlpExtractedTask {
     if (parsed.intent === 'UNKNOWN') {
       const fastFallback = this.fastPatternParse(text, currentIso);
@@ -526,17 +580,21 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     }
 
     if (parsed.intent === 'CREATE_TASK') {
-      const isCritical = /gấp|khẩn|quan trọng|nhớ nhắc kỹ/i.test(text);
+      const isCritical = CRITICAL_RE.test(text);
 
       if (!parsed.title || !parsed.title.trim()) {
         parsed.title = this.buildCleanTitle(text) || text;
       } else {
-        parsed.title = parsed.title.trim();
+        // Models sometimes wrap the title in quotes
+        parsed.title = parsed.title.trim().replace(/^["'“”‘’`]+|["'“”‘’`]+$/g, '').trim() || this.buildCleanTitle(text) || text;
       }
 
       // Detect and eliminate model reasoning leakage (e.g. Chinese thought text, nested JSON, prompt echoes)
       const hasChinese = /[\u4e00-\u9fa5]/.test(parsed.title);
-      const hasJsonOrNotes = /->\s*\{|\{"title"|Title:|Due:|\(Note:/i.test(parsed.title);
+      // Also catches date/time debris such as "Họp (20-06T:00+) họp"
+      const hasJsonOrNotes =
+        /->\s*\{|\{"title"|Title:|Due:|\(Note:/i.test(parsed.title) ||
+        /\([^)]*\d[^)]*\)|\d{4}-\d{2}-\d{2}|\d{2}-\d{2}T|T\d{2}:?\d{2}/.test(parsed.title);
       if (hasChinese || hasJsonOrNotes || (parsed.title.length > 80 && text.length < 50)) {
         console.warn(`[NLP-DEBUG] ⚠️ Detected reasoning leakage in title ("${parsed.title}"). Cleaning...`);
         // Try to extract from nested JSON if model dumped JSON inside title
@@ -558,14 +616,22 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         }
       }
 
-      // Clean leftover time keywords from title (e.g. "Chiều 5h về đi cắt tóc" -> "về đi cắt tóc")
-      const cleanedTitle = this.buildCleanTitle(parsed.title);
-      if (cleanedTitle && cleanedTitle.length >= 2) {
-        parsed.title = cleanedTitle;
+      // Only clean when time phrases actually leaked into the title; otherwise trust the model
+      // (aggressive cleaning would eat "2 phòng ban", names like "anh Mai", etc.)
+      if (TIME_RESIDUE_RE.test(parsed.title)) {
+        const cleanedTitle = this.buildCleanTitle(parsed.title);
+        if (cleanedTitle && cleanedTitle.length >= 2) {
+          parsed.title = cleanedTitle;
+        }
       }
 
       if (parsed.title) {
         parsed.title = parsed.title.charAt(0).toUpperCase() + parsed.title.slice(1);
+      }
+
+      // Validate model-provided due date; an unparseable value is treated as missing
+      if (parsed.due_at_iso && isNaN(new Date(parsed.due_at_iso).getTime())) {
+        parsed.due_at_iso = null;
       }
 
       if (!parsed.due_at_iso) {
@@ -576,7 +642,42 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
             parsed.remind_before_minutes = regexTask.remind_before_minutes;
           }
         } else {
+          // No time information at all: flag it so the bot can tell the user instead of guessing silently
           parsed.due_at_iso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+          parsed.time_assumed = true;
+        }
+      }
+
+      if (parsed.recurrence_rrule && !VALID_RRULE_RE.test(parsed.recurrence_rrule.trim().toUpperCase())) {
+        parsed.recurrence_rrule = null;
+      } else if (parsed.recurrence_rrule) {
+        parsed.recurrence_rrule = parsed.recurrence_rrule.trim().toUpperCase();
+      }
+
+      // Weaker models sometimes drop the recurrence; explicit phrases ("hàng tuần", "mỗi ngày") are
+      // reliably detectable, so recover rule and first occurrence from the deterministic parser.
+      if (!parsed.recurrence_rrule) {
+        const rx = this.fastPatternParse(text, currentIso);
+        if (rx?.recurrence_rrule) {
+          parsed.recurrence_rrule = rx.recurrence_rrule;
+          if (rx.due_at_iso) parsed.due_at_iso = rx.due_at_iso;
+        }
+      }
+
+      // A recurring task's first occurrence must be in the future (e.g. "thứ 2 hàng tuần 6h" said on Monday 8h)
+      if (parsed.recurrence_rrule && parsed.due_at_iso) {
+        const dueMs = new Date(parsed.due_at_iso).getTime();
+        if (!isNaN(dueMs) && dueMs <= Date.now()) {
+          try {
+            parsed.due_at_iso = calculateNextRecurrence(
+              parsed.due_at_iso,
+              parsed.due_at_iso,
+              parsed.recurrence_rrule,
+              timezone
+            ).dueAt;
+          } catch {
+            // keep model value; webhook rejects past times
+          }
         }
       }
 
@@ -600,15 +701,17 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    * Deterministic fallback when Gemini API is unavailable, times out, or has no API key.
    */
   private heuristicFallback(text: string, currentIso: string): NlpExtractedTask {
+    const isCritical = CRITICAL_RE.test(text);
     return (
       this.fastPatternParse(text, currentIso) || {
         intent: 'CREATE_TASK',
         title: this.buildCleanTitle(text) || text,
         due_at_iso: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
         remind_before_minutes: 0,
-        priority: 'MEDIUM',
-        nagging_mode: false,
+        priority: isCritical ? 'CRITICAL' : 'MEDIUM',
+        nagging_mode: isCritical,
         recurrence_rrule: null,
+        time_assumed: true,
       }
     );
   }
@@ -652,7 +755,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       explicitRemindBefore = parseInt(remindBeforeMatch[1], 10);
     }
 
-    const isCritical = /gấp|khẩn|quan trọng|nhớ nhắc kỹ/.test(lower);
+    const isCritical = CRITICAL_RE.test(lower);
     const priority = isCritical ? 'CRITICAL' : 'MEDIUM';
 
     // Parse base date, current clock time & tz offset from currentIso (e.g. "2026-10-22T10:30:00+07:00")
@@ -696,11 +799,20 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       /\b(sáng|trưa|chiều|tối)\s+(?:lúc\s+)?(\d{1,2})\s*(?:h|giờ|:)?\s*(\d{1,2})?\s*(rưỡi)?(?!\p{L})/u
     );
 
+    // "9h kém 15" = 08:45
+    const kemMatch = lowerWithoutRemindBefore.match(/(\d{1,2})\s*(?:h|giờ)\s*kém\s*(\d{1,2})/);
+
     let targetHour: number | null = null;
     let targetMinute = 0;
     let matchedAbsoluteTime = false;
 
-    if (timeWithPeriod) {
+    if (kemMatch && parseInt(kemMatch[1], 10) >= 1 && parseInt(kemMatch[2], 10) >= 1 && parseInt(kemMatch[2], 10) < 60) {
+      let h = parseInt(kemMatch[1], 10) - 1;
+      if (/chiều|tối/.test(lowerWithoutRemindBefore) && h < 12) h += 12;
+      targetHour = h;
+      targetMinute = 60 - parseInt(kemMatch[2], 10);
+      matchedAbsoluteTime = true;
+    } else if (timeWithPeriod) {
       const h = parseInt(timeWithPeriod[1], 10);
       if (h >= 1 && h <= 12) {
         const capturedMin = timeWithPeriod[2];
@@ -714,6 +826,8 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
             targetHour = h < 12 ? h + 12 : h;
           } else if (period === 'sáng' && h === 12) {
             targetHour = 0;
+          } else if (period === 'trưa' && h < 11) {
+            targetHour = h + 12;
           } else {
             targetHour = h;
           }
@@ -746,33 +860,28 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     // ================================================================
     // STEP 3: Relative time (e.g. "10p nữa", "sau 15 phút", "trong 2 tiếng nữa", "nửa tiếng nữa")
     // ================================================================
+    let relDayOffset: number | null = null;
     if (!matchedAbsoluteTime) {
-      const relMinMatch = lowerWithoutRemindBefore.match(
-        /(?:sau|trong)?\s*(\d+)\s*(?:phút|p)\s*(?:nữa)?/
+      const lw = lowerWithoutRemindBefore;
+      // Require "sau/trong N" or "N ... nữa" so "tuần sau 9h" is never read as "in 9 hours"
+      const relMinMatch = lw.match(
+        /(?:(?:(?<!(?:tuần|tháng|năm)\s)sau|trong)\s+(\d+)\s*(?:phút|p)(?!\p{L})|(\d+)\s*(?:phút|p)(?!\p{L})\s*nữa|nhắc\s+(?:tôi\s+|mình\s+|em\s+)?(\d+)\s*(?:phút|p)(?!\p{L}))/u
       );
-      const relHourMatch = lowerWithoutRemindBefore.match(
-        /(?:sau|trong)?\s*(\d+)\s*(?:tiếng|giờ|h)\s*(?:nữa)?/
+      const relHourMatch = lw.match(
+        /(?:(?:(?<!(?:tuần|tháng|năm)\s)sau|trong)\s+(\d+)\s*(?:tiếng|giờ|h)(?!\p{L})|(\d+)\s*(?:tiếng|giờ|h)(?!\p{L})\s*nữa)/u
       );
-      const isHalfHour = /nửa\s+(?:tiếng|giờ)/.test(lowerWithoutRemindBefore);
+      const relDayMatch = lw.match(/(?:(?:(?<!(?:tuần|tháng|năm)\s)sau|trong)\s+(\d+)\s*ngày(?!\p{L})|(\d+)\s*ngày\s*nữa)/u);
+      const isHalfHour = /nửa\s+(?:tiếng|giờ)/.test(lw);
 
       let minutesToAdd = 0;
       if (isHalfHour) {
         minutesToAdd = 30;
-      } else if (
-        relMinMatch &&
-        (lowerWithoutRemindBefore.includes('nữa') ||
-          lowerWithoutRemindBefore.includes('sau') ||
-          lowerWithoutRemindBefore.includes('trong') ||
-          lowerWithoutRemindBefore.includes('nhắc'))
-      ) {
-        minutesToAdd = parseInt(relMinMatch[1], 10);
-      } else if (
-        relHourMatch &&
-        (lowerWithoutRemindBefore.includes('nữa') ||
-          lowerWithoutRemindBefore.includes('sau') ||
-          lowerWithoutRemindBefore.includes('trong'))
-      ) {
-        minutesToAdd = parseInt(relHourMatch[1], 10) * 60;
+      } else if (relMinMatch) {
+        minutesToAdd = parseInt(relMinMatch[1] ?? relMinMatch[2] ?? relMinMatch[3], 10);
+      } else if (relHourMatch) {
+        minutesToAdd = parseInt(relHourMatch[1] ?? relHourMatch[2], 10) * 60;
+      } else if (relDayMatch) {
+        relDayOffset = parseInt(relDayMatch[1] ?? relDayMatch[2], 10);
       }
 
       if (minutesToAdd > 0) {
@@ -796,8 +905,8 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     // ================================================================
     if (!matchedAbsoluteTime) {
       const standalonePeriodMatch =
-        lowerWithoutRemindBefore.match(/\b(sáng|trưa|chiều|tối)\s*(?:hôm\s*nay|nay|ngày\s*mai|mai|mốt|ngày\s*kia)\b/) ||
-        lowerWithoutRemindBefore.match(/\b(?:hôm\s*nay|nay|ngày\s*mai|mai|mốt|ngày\s*kia)\s+(sáng|trưa|chiều|tối)\b/);
+        lowerWithoutRemindBefore.match(/(?<!\p{L})(sáng|trưa|chiều|tối)\s*(?:hôm\s*nay|nay|ngày\s*mai|mai|mốt|ngày\s*kia)(?!\p{L})/u) ||
+        lowerWithoutRemindBefore.match(/(?<!\p{L})(?:hôm\s*nay|nay|ngày\s*mai|mai|mốt|ngày\s*kia)\s+(sáng|trưa|chiều|tối)(?!\p{L})/u);
 
       if (standalonePeriodMatch) {
         const period = standalonePeriodMatch[1];
@@ -818,7 +927,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     // ================================================================
     if (!matchedAbsoluteTime) {
       const time24Match = lowerWithoutRemindBefore.match(
-        /(?:lúc\s+)?(\d{1,2})[h:](\d{1,2})?(?!\p{L})/u
+        /(?:lúc\s+)?(\d{1,2})\s*(?:h|giờ|:)\s*(\d{1,2})?(?!\p{L})/u
       );
       if (time24Match) {
         const h = parseInt(time24Match[1], 10);
@@ -846,7 +955,19 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       /(?:(thứ\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\s*nhật))(?:\s+(tuần\s+(?:sau|tới|này)))?/
     );
 
-    if (targetHour === null && (explicitDateMatch || weekdayMatch)) {
+    const dayAfter = DAY_AFTER_RE.test(lowerWithoutRemindBefore);
+    const tomorrow = TOMORROW_RE.test(lowerWithoutRemindBefore);
+    const todayWord = TODAY_RE.test(lowerWithoutRemindBefore);
+    const nextMonday = /đầu\s+tuần\s+(?:sau|tới)/.test(lowerWithoutRemindBefore);
+    const weekendWord = /cuối\s+tuần(?!\s+(?:sau|tới))/.test(lowerWithoutRemindBefore);
+    const endOfMonth = /cuối\s+tháng/.test(lowerWithoutRemindBefore);
+    const nextWeekOnly = !weekdayMatch && /tuần\s+(?:sau|tới)/.test(lowerWithoutRemindBefore);
+    const hasDateHint =
+      !!explicitDateMatch || !!weekdayMatch || dayAfter || tomorrow || todayWord ||
+      nextMonday || weekendWord || endOfMonth || nextWeekOnly || relDayOffset !== null;
+
+    // A date with no clock time defaults to 09:00 (or the period default, e.g. "tối" = 20:00)
+    if (targetHour === null && hasDateHint) {
       const extracted = this.extractTimeFromText(lowerWithoutRemindBefore);
       targetHour = extracted.hour;
       targetMinute = extracted.minute;
@@ -913,12 +1034,24 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         ddNum = targetDate.getUTCDate();
       } else {
         let dayOffset = 0;
-        const hasExplicitToday = /\b(?:hôm\s*nay|nay)\b/.test(lowerWithoutRemindBefore);
-        if (/\bmốt\b/.test(lowerWithoutRemindBefore) || /\bngày\s*kia\b/.test(lowerWithoutRemindBefore)) {
+        const hasExplicitToday = todayWord;
+        const todayDate = new Date(Date.UTC(baseY, baseM - 1, baseD));
+        const currentWeekday = todayDate.getUTCDay();
+        if (relDayOffset !== null) {
+          dayOffset = relDayOffset;
+        } else if (dayAfter) {
           dayOffset = 2;
-        } else if (/\bmai\b/.test(lowerWithoutRemindBefore) || /\bngày\s*mai\b/.test(lowerWithoutRemindBefore)) {
+        } else if (tomorrow) {
           dayOffset = 1;
-        } else if (!hasExplicitToday) {
+        } else if (nextMonday) {
+          dayOffset = 7 - ((currentWeekday + 6) % 7);
+        } else if (nextWeekOnly) {
+          dayOffset = 7;
+        } else if (weekendWord) {
+          dayOffset = (6 - currentWeekday + 7) % 7;
+        } else if (endOfMonth) {
+          dayOffset = getDaysInMonth(baseY, baseM) - baseD;
+        } else if (!hasExplicitToday && !hasDateHint) {
           // If no date word was specified and the target time has already passed today, schedule for tomorrow
           const timeAlreadyPassedToday =
             targetHour < currentHour || (targetHour === currentHour && targetMinute <= currentMinute);
@@ -1040,32 +1173,32 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       };
     }
 
-    // --- "thứ X hàng tuần" / "thứ X mỗi tuần" ---
-    const weeklyMatch = lower.match(/thứ\s+(hai|ba|tư|năm|sáu|bảy|\d)\s+(?:hàng|mỗi)\s+tuần/);
-    if (weeklyMatch) {
-      const dayMap: Record<string, string> = {
-        hai: 'MO', '2': 'MO',
-        ba: 'TU', '3': 'TU',
-        'tư': 'WE', '4': 'WE',
-        'năm': 'TH', '5': 'TH',
-        'sáu': 'FR', '6': 'FR',
-        'bảy': 'SA', '7': 'SA',
+    // --- "thứ X hàng tuần", "thứ 2 và thứ 4 hàng tuần", "mỗi thứ 6", "chủ nhật hàng tuần" ---
+    if (/(?:hàng|mỗi)\s+(?:tuần|thứ|chủ\s*nhật)/.test(lower)) {
+      const codeMap: Record<string, string> = {
+        hai: 'MO', '2': 'MO', ba: 'TU', '3': 'TU', 'tư': 'WE', '4': 'WE',
+        'năm': 'TH', '5': 'TH', 'sáu': 'FR', '6': 'FR', 'bảy': 'SA', '7': 'SA',
       };
-      const rruleDay = dayMap[weeklyMatch[1]];
-      if (rruleDay) {
-        const jsWeekday: Record<string, number> = {
-          MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6, SU: 0,
-        };
-        const targetWeekday = jsWeekday[rruleDay]!;
+      const jsWeekday: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
+      const codes: string[] = [];
+      for (const m of lower.matchAll(/thứ\s+(hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\s*nhật/g)) {
+        const code = m[1] ? codeMap[m[1]] : 'SU';
+        if (code && !codes.includes(code)) codes.push(code);
+      }
+
+      if (codes.length > 0) {
         const todayDate = new Date(Date.UTC(baseY, baseM - 1, baseD));
         const currentWeekday = todayDate.getUTCDay();
         const { hour, minute } = this.extractTimeFromText(lower);
         const timeAlreadyPassedToday =
           hour < currentHour || (hour === currentHour && minute <= currentMinute);
 
-        let daysUntil = targetWeekday - currentWeekday;
-        if (daysUntil < 0 || (daysUntil === 0 && timeAlreadyPassedToday)) {
-          daysUntil += 7;
+        // Earliest upcoming occurrence among all requested weekdays
+        let daysUntil = Infinity;
+        for (const code of codes) {
+          let d = jsWeekday[code] - currentWeekday;
+          if (d < 0 || (d === 0 && timeAlreadyPassedToday)) d += 7;
+          daysUntil = Math.min(daysUntil, d);
         }
 
         const nextOccurrence = new Date(Date.UTC(baseY, baseM - 1, baseD + daysUntil));
@@ -1083,41 +1216,9 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
           remind_before_minutes: explicitRemindBefore ?? 0,
           priority,
           nagging_mode: isCritical,
-          recurrence_rrule: `FREQ=WEEKLY;BYDAY=${rruleDay}`,
+          recurrence_rrule: `FREQ=WEEKLY;BYDAY=${codes.join(',')}`,
         };
       }
-    }
-
-    // --- "chủ nhật hàng tuần" / "chủ nhật mỗi tuần" ---
-    if (/chủ\s*nhật\s+(?:hàng|mỗi)\s+tuần/.test(lower)) {
-      const todayDate = new Date(Date.UTC(baseY, baseM - 1, baseD));
-      const currentWeekday = todayDate.getUTCDay();
-      const { hour, minute } = this.extractTimeFromText(lower);
-      const timeAlreadyPassedToday =
-        hour < currentHour || (hour === currentHour && minute <= currentMinute);
-
-      let daysUntil = 0 - currentWeekday; // Sunday = 0
-      if (daysUntil < 0 || (daysUntil === 0 && timeAlreadyPassedToday)) {
-        daysUntil += 7;
-      }
-
-      const nextOccurrence = new Date(Date.UTC(baseY, baseM - 1, baseD + daysUntil));
-      const yy = nextOccurrence.getUTCFullYear();
-      const mm = (nextOccurrence.getUTCMonth() + 1).toString().padStart(2, '0');
-      const dd = nextOccurrence.getUTCDate().toString().padStart(2, '0');
-      const hh = hour.toString().padStart(2, '0');
-      const mi = minute.toString().padStart(2, '0');
-      const cleanTitle = this.buildCleanTitle(originalText);
-
-      return {
-        intent: 'CREATE_TASK',
-        title: cleanTitle || originalText,
-        due_at_iso: `${yy}-${mm}-${dd}T${hh}:${mi}:00${tzOffset}`,
-        remind_before_minutes: explicitRemindBefore ?? 0,
-        priority,
-        nagging_mode: isCritical,
-        recurrence_rrule: 'FREQ=WEEKLY;BYDAY=SU',
-      };
     }
 
     return null;
@@ -1127,6 +1228,15 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    * Helper: Extracts time-of-day from text, default to 09:00 if unspecified.
    */
   private extractTimeFromText(lower: string): { hour: number; minute: number } {
+    const kem = lower.match(/(\d{1,2})\s*(?:h|giờ)\s*kém\s*(\d{1,2})/);
+    if (kem) {
+      const kh = parseInt(kem[1], 10) - 1;
+      const km = parseInt(kem[2], 10);
+      if (kh >= 0 && km >= 1 && km < 60) {
+        return { hour: /chiều|tối/.test(lower) && kh < 12 ? kh + 12 : kh, minute: 60 - km };
+      }
+    }
+
     const withPeriod = lower.match(
       /(\d{1,2})\s*(?:h|giờ|:)?\s*(\d{1,2})?\s*(rưỡi)?\s*(sáng|trưa|chiều|tối)/
     );
@@ -1164,7 +1274,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       }
     }
 
-    const time24 = lower.match(/(?:lúc\s+)?(\d{1,2})[h:](\d{1,2})?(?!\p{L})/u);
+    const time24 = lower.match(/(?:lúc\s+)?(\d{1,2})\s*(?:h|giờ|:)\s*(\d{1,2})?(?!\p{L})/u);
     if (time24) {
       const h = parseInt(time24[1], 10);
       const m = time24[2] ? parseInt(time24[2], 10) : 0;
@@ -1186,7 +1296,9 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    */
   private buildCleanTitle(text: string): string {
     return text
-      // 1. Remove recurring patterns FIRST (before general hours or numbers to avoid "4 hàng" -> "4h")
+      // 0. Weekday lists first ("thứ 2 và thứ 4 hàng tuần"), before single "thứ X hàng tuần" eats the tail
+      .replace(new RegExp(`(?:${WEEKDAY_SRC})(?:\\s*(?:,|và)\\s*(?:${WEEKDAY_SRC}))+`, 'giu'), '')
+      // 1. Remove recurring patterns (before general hours or numbers to avoid "4 hàng" -> "4h")
       .replace(/ngày\s+\d{1,2}\s+(?:hàng|mỗi)\s+tháng/gi, '')
       .replace(/(?:hàng|mỗi)\s+tháng\s+(?:vào\s+)?ngày\s+\d{1,2}/gi, '')
       .replace(/(?:(?:sáng|trưa|chiều|tối)\s+)?thứ\s+(?:\d|hai|ba|tư|năm|sáu|bảy)\s+(?:hàng|mỗi)\s+tuần/gi, '')
@@ -1196,6 +1308,8 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       .replace(/(?:nhắc|báo)\s+trước\s+\d+\s*(?:phút|p)/gi, '')
       // 3. Remove "nhắc tôi/mình/em"
       .replace(/nhắc\s*(?:tôi|mình|em)?\s*/gi, '')
+      // 4-pre. "9h kém 15"
+      .replace(/\d{1,2}\s*(?:h|giờ)\s*kém\s*\d{1,2}/gi, '')
       // 4A. Remove time + period: "4h30 chiều", "4 giờ 45 chiều", "3 rưỡi sáng", "8 giờ tối"
       .replace(/\d{1,2}\s*(?:h|giờ|:)?\s*\d{0,2}\s*(?:rưỡi)?\s*(?:sáng|trưa|chiều|tối)/gi, '')
       // 4B. Remove period + time: "chiều 5h", "chiều 5h30", "chiều 5 rưỡi", "tối 8h", "sáng 7h"
@@ -1216,14 +1330,18 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       // 8. Remove standalone date words: "hôm nay", "ngày mai", "ngày kia"
       .replace(/\bhôm\s*nay\b/gi, '')
       .replace(/\bngày\s*(?:mai|mốt|kia)\b/gi, '')
-      .replace(/\b(?:mai|mốt|nay)\b/gi, '')
-      // 9. Remove 24h format: "16h30", "lúc 15h" — require h/: not immediately followed by letter
-      .replace(/(?:lúc\s+)?\d{1,2}(?:h(?!\p{L})|:)\d{0,2}/gu, '')
+      .replace(new RegExp(`${L}${NAME_PREFIX}(?:mai|mốt|nay)${R}`, 'giu'), '')
+      .replace(/đầu\s+tuần\s+(?:sau|tới)|cuối\s+tuần|cuối\s+tháng|tuần\s+(?:sau|tới)/gi, '')
       // 10. Remove relative time: "sau 10 phút", "2 tiếng nữa", "nửa tiếng nữa"
-      .replace(/(?:sau|trong)?\s*\d+\s*(?:phút|p|tiếng|giờ)\s*(?:nữa)?/gi, '')
+      // Require "sau/trong N" or "N ... nữa" so "họp 2 phòng ban" / "mua 3 phở" survive
+      .replace(/(?:sau|trong)\s+\d+\s*(?:phút|p|tiếng|giờ|h|ngày)(?!\p{L})(?:\s*nữa)?/giu, '')
+      .replace(/\d+\s*(?:phút|p|tiếng|giờ|h|ngày)(?!\p{L})\s*nữa/giu, '')
       .replace(/nửa\s+(?:tiếng|giờ)\s*(?:nữa)?/gi, '')
+      // 9. Remove 24h format: "16h30", "lúc 15h" — require h/: not immediately followed by letter
+      .replace(/(?:lúc\s+)?\d{1,2}\s*(?:h(?!\p{L})|giờ(?!\p{L})|:)\s*\d{0,2}/gu, '')
       // 11. Remove priority words and filler words ("việc gấp", "nhé")
-      .replace(/(?:việc\s+)?(?:gấp|khẩn\s*cấp|khẩn|quan trọng|nhớ nhắc kỹ)(?:\s+nhé)?/gi, '')
+      .replace(CRITICAL_STRIP_RE, '')
+      .replace(/(?:^|\s)(?:nhé|nha)\s*[.!]*$/i, '')
       .replace(/\blúc\b/gi, '')
       // 12. Normalize whitespace and trailing symbols
       .replace(/\s+/g, ' ')

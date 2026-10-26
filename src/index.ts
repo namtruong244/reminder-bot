@@ -231,6 +231,12 @@ app.post('/api/migrate', requireAdminAuth, async (c) => {
     CREATE INDEX IF NOT EXISTS idx_tasks_due_scan ON tasks(status, remind_at);
     CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks(user_id, status);
     CREATE INDEX IF NOT EXISTS idx_tasks_ios_synced ON tasks(ios_synced, status);
+
+    CREATE TABLE IF NOT EXISTS processed_updates (
+        update_id INTEGER PRIMARY KEY,
+        received_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_processed_updates_received ON processed_updates(received_at);
   `;
 
   try {
@@ -245,51 +251,54 @@ app.post('/api/migrate', requireAdminAuth, async (c) => {
 
 /**
  * Middleware for iOS Bridge authentication.
- * Accepts:
+ * Accepts (headers only, so the secret never lands in URLs/logs):
  *  - Header: Authorization: Bearer <secret>
- *  - Header: Authorization: <secret>
- *  - Header: X-Bridge-Token: <secret> / X-API-Key: <secret>
- *  - Query param: ?token=<secret> / ?secret=<secret> / ?key=<secret>
+ *  - Header: X-Bridge-Token: <secret> / X-API-Key: <secret> / Token: <secret>
+ * The secret is IOS_BRIDGE_SECRET only; ENCRYPTION_SECRET_KEY must never be reused here.
  */
+const timingSafeEqual = (a: string, b: string): boolean => {
+  const enc = new TextEncoder();
+  const ab = enc.encode(a);
+  const bb = enc.encode(b);
+  let diff = ab.length ^ bb.length;
+  for (let i = 0; i < Math.max(ab.length, bb.length); i++) {
+    diff |= (ab[i] ?? 0) ^ (bb[i] ?? 0);
+  }
+  return diff === 0;
+};
+
 const authIosBridge = async (c: Context<{ Bindings: Env }>, next: Next) => {
-  const expectedSecret = c.env.IOS_BRIDGE_SECRET || c.env.ENCRYPTION_SECRET_KEY;
+  const expectedSecret = c.env.IOS_BRIDGE_SECRET;
 
   if (!expectedSecret) {
-    return c.json({ error: 'iOS Bridge secret is not configured on server' }, 500);
+    return c.json({ error: 'IOS_BRIDGE_SECRET is not configured on server' }, 500);
   }
 
   const authHeader = c.req.header('Authorization');
-  const customHeader =
-    c.req.header('X-Bridge-Token') ||
-    c.req.header('X-API-Key') ||
-    c.req.header('Token');
-  const queryToken =
-    c.req.query('token') ||
-    c.req.query('secret') ||
-    c.req.query('key') ||
-    c.req.query('auth');
+  const bearer = authHeader && /^Bearer\s+/i.test(authHeader)
+    ? authHeader.replace(/^Bearer\s+/i, '').trim()
+    : undefined;
 
-  let providedToken: string | undefined;
+  const candidates = [
+    bearer,
+    c.req.header('X-Bridge-Token'),
+    c.req.header('X-API-Key'),
+    c.req.header('Token'),
+  ]
+    .filter((v): v is string => !!v)
+    .map((v) => v.trim());
 
-  if (authHeader) {
-    providedToken = authHeader.replace(/^Bearer\s+/i, '').trim();
-  } else if (customHeader) {
-    providedToken = customHeader.trim();
-  } else if (queryToken) {
-    providedToken = queryToken.trim();
-  }
-
-  if (!providedToken) {
+  if (candidates.length === 0) {
     return c.json(
       {
         error:
-          'Missing authorization. Provide header "Authorization: Bearer <token>", header "X-Bridge-Token: <token>", or query parameter "?token=<token>"',
+          'Missing authorization. Provide header "Authorization: Bearer <token>" or "X-Bridge-Token: <token>"',
       },
       401
     );
   }
 
-  if (providedToken !== expectedSecret) {
+  if (!candidates.some((t) => timingSafeEqual(t, expectedSecret))) {
     return c.json({ error: 'Unauthorized: Invalid token' }, 401);
   }
 
@@ -302,14 +311,6 @@ const authIosBridge = async (c: Context<{ Bindings: Env }>, next: Next) => {
 async function parseAnyRequestBody(c: Context<{ Bindings: Env }>): Promise<unknown> {
   const contentType = (c.req.header('Content-Type') || '').toLowerCase();
 
-  if (contentType.includes('application/json')) {
-    try {
-      return await c.req.json();
-    } catch {
-      // Fallback below
-    }
-  }
-
   if (
     contentType.includes('application/x-www-form-urlencoded') ||
     contentType.includes('multipart/form-data')
@@ -317,10 +318,11 @@ async function parseAnyRequestBody(c: Context<{ Bindings: Env }>): Promise<unkno
     try {
       return await c.req.parseBody();
     } catch {
-      // Fallback below
+      return null;
     }
   }
 
+  // Read the body exactly once as text: a failed c.req.json() would poison the cached body.
   try {
     const rawText = (await c.req.text()).trim();
     if (!rawText) return null;
@@ -350,6 +352,8 @@ async function parseAnyRequestBody(c: Context<{ Bindings: Env }>): Promise<unkno
  *  - Query params (?task_id=abc, ?id=abc, ?task_ids=abc,def)
  *  - Raw string / newline-delimited text
  */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function extractTaskIds(
   body: unknown,
   queryParams: Record<string, string | undefined>
@@ -382,10 +386,7 @@ function extractTaskIds(
       }
       if (!matchedKnownKey) {
         for (const [k, v] of Object.entries(obj)) {
-          if (
-            typeof v === 'string' &&
-            (k.toLowerCase().includes('id') || /^[0-9a-f-]{32,36}$/i.test(v))
-          ) {
+          if (typeof v === 'string' && UUID_RE.test(v.trim())) {
             addValue(v);
           }
         }
@@ -417,7 +418,8 @@ app.get('/api/ios/unsynced', authIosBridge, async (c) => {
   }
 
   const limitQuery = c.req.query('limit');
-  const limit = limitQuery ? Math.min(parseInt(limitQuery, 10) || 50, 100) : 50;
+  const parsedLimit = limitQuery ? parseInt(limitQuery, 10) : NaN;
+  const limit = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(parsedLimit, 100) : 50;
 
   const taskService = new TaskService(c.env.DB);
   const unsynced = await taskService.getUnsyncedIosTasks(limit, parsedUserId);
@@ -439,14 +441,11 @@ app.get('/api/ios/unsynced', authIosBridge, async (c) => {
 
 /**
  * Marks task(s) as synced (ios_synced = 1) in Cloudflare D1.
- * Supports POST /api/ios/synced, POST /api/ios/sync, GET /api/ios/synced, GET /api/ios/sync
+ * Supports POST /api/ios/synced and POST /api/ios/sync (state-changing, so no GET)
  * Accepts single task_id, array of task_ids, or query parameter.
  */
 const handleMarkSynced = async (c: Context<{ Bindings: Env }>) => {
-  let body: unknown = null;
-  if (c.req.method === 'POST') {
-    body = await parseAnyRequestBody(c);
-  }
+  const body = await parseAnyRequestBody(c);
 
   const queryParams = {
     task_id: c.req.query('task_id'),
@@ -471,31 +470,70 @@ const handleMarkSynced = async (c: Context<{ Bindings: Env }>) => {
   }
 
   const taskService = new TaskService(c.env.DB);
-  await taskService.batchMarkTasksIosSynced(taskIds, 1);
+  const updatedIds = await taskService.batchMarkTasksIosSynced(taskIds, 1);
+
+  if (updatedIds.length === 0) {
+    return c.json({ error: 'No matching tasks found', requested_ids: taskIds }, 404);
+  }
 
   return c.json({
     success: true,
-    synced_count: taskIds.length,
-    updated_ids: taskIds,
+    synced_count: updatedIds.length,
+    updated_ids: updatedIds,
   });
 };
 
 app.post('/api/ios/synced', authIosBridge, handleMarkSynced);
 app.post('/api/ios/sync', authIosBridge, handleMarkSynced);
-app.get('/api/ios/synced', authIosBridge, handleMarkSynced);
-app.get('/api/ios/sync', authIosBridge, handleMarkSynced);
+
+/**
+ * GET /api/ios/closed
+ * Returns tasks completed/cancelled on the Telegram side that still have an open reminder on
+ * the iPhone (ios_synced = 1). The Shortcut should complete/delete them, then POST /api/ios/closed.
+ */
+app.get('/api/ios/closed', authIosBridge, async (c) => {
+  const userIdQuery = c.req.query('user_id');
+  const parsedUserId = userIdQuery ? parseInt(userIdQuery, 10) : undefined;
+  if (userIdQuery && Number.isNaN(parsedUserId)) {
+    return c.json({ error: 'Invalid user_id query parameter' }, 400);
+  }
+
+  const taskService = new TaskService(c.env.DB);
+  const closed = await taskService.getIosClosedTasks(100, parsedUserId);
+  return c.json({
+    count: closed.length,
+    tasks: closed.map((t) => ({
+      id: t.id,
+      user_id: t.user_id,
+      title: t.title,
+      status: t.status,
+    })),
+  });
+});
+
+/** POST /api/ios/closed — confirms the iPhone reminders were closed (ios_synced = 2). */
+app.post('/api/ios/closed', authIosBridge, async (c) => {
+  const taskIds = extractTaskIds(await parseAnyRequestBody(c), {
+    task_id: c.req.query('task_id'),
+    id: c.req.query('id'),
+    task_ids: c.req.query('task_ids'),
+    ids: c.req.query('ids'),
+  });
+  if (taskIds.length === 0) {
+    return c.json({ error: 'No task ID provided' }, 400);
+  }
+  const taskService = new TaskService(c.env.DB);
+  const updatedIds = await taskService.batchMarkTasksIosSynced(taskIds, 2);
+  return c.json({ success: true, synced_count: updatedIds.length, updated_ids: updatedIds });
+});
 
 /**
  * POST /api/ios/webhook
  * Receives completion events from iOS Shortcut when user marks a reminder done on iPhone.
  */
 app.post('/api/ios/webhook', authIosBridge, async (c) => {
-  let body: any = null;
-  try {
-    body = await parseAnyRequestBody(c);
-  } catch {
-    body = null;
-  }
+  const parsed = await parseAnyRequestBody(c);
+  const body: any = parsed && typeof parsed === 'object' ? parsed : null;
 
   const taskId =
     body?.task_id ||
@@ -508,7 +546,10 @@ app.post('/api/ios/webhook', authIosBridge, async (c) => {
     return c.json({ error: 'Missing task_id. Send { "task_id": "..." }' }, 400);
   }
 
-  const rawAction = body?.action || c.req.query('action') || 'COMPLETED';
+  const rawAction = body?.action || c.req.query('action');
+  if (!rawAction) {
+    return c.json({ error: 'Missing action. Expected COMPLETED or CANCELLED' }, 400);
+  }
   const action = String(rawAction).toUpperCase();
 
   if (action !== 'COMPLETED' && action !== 'CANCELLED') {
@@ -520,6 +561,11 @@ app.post('/api/ios/webhook', authIosBridge, async (c) => {
 
   if (!task) {
     return c.json({ error: 'Task not found' }, 404);
+  }
+
+  // Idempotency: repeated/late iOS events must not re-complete, re-cancel or re-advance tasks.
+  if (task.status !== 'PENDING') {
+    return c.json({ success: true, task_id: taskId, action, ignored: true, status: task.status });
   }
 
   const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
@@ -576,6 +622,7 @@ export default {
     // If cron trigger is at 01:00 UTC (08:00 VN)
     if (event.cron === '0 1 * * *') {
       ctx.waitUntil(notifier.processMorningBriefing());
+      ctx.waitUntil(new TaskService(env.DB).purgeProcessedUpdates());
       return;
     }
 

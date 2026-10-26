@@ -179,6 +179,7 @@ ${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}
 🔗 *API Endpoints cho iOS Phím tắt (Shortcuts):*
 • Kéo việc chưa đồng bộ: \`GET /api/ios/unsynced\`
 • Báo đã đồng bộ: \`POST /api/ios/synced\` (gửi \`task_id\` hoặc \`id\`)
+• Việc đã xong/hủy trên Telegram cần đóng trên iPhone: \`GET /api/ios/closed\`, rồi \`POST /api/ios/closed\`
 • Đánh dấu hoàn thành từ iOS: \`POST /api/ios/webhook\`
 
 💡 _Mẹo: Mở app Phím tắt (Shortcuts) trên iPhone để chạy automation đồng bộ._
@@ -228,7 +229,7 @@ ${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}
       ? `${geminiKey.substring(0, 6)}...${geminiKey.substring(geminiKeyLen - 4)}`
       : 'CHƯA CẤU HÌNH (RỖNG)';
 
-    const modelName = this.env.LLM_MODEL || 'gemini-3.8-flash';
+    const modelName = this.env.LLM_MODEL || 'gemini-3.5-flash';
 
     // If no query text provided, show environment diagnostics
     if (!queryText || queryText.trim().length === 0) {
