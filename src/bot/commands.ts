@@ -229,7 +229,7 @@ ${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}
       ? `${geminiKey.substring(0, 6)}...${geminiKey.substring(geminiKeyLen - 4)}`
       : 'CHƯA CẤU HÌNH (RỖNG)';
 
-    const modelName = this.env.LLM_MODEL || 'gemini-3.5-flash';
+    const modelName = this.env.LLM_MODEL || 'gemini-3.1-flash-lite';
 
     // If no query text provided, show environment diagnostics
     if (!queryText || queryText.trim().length === 0) {

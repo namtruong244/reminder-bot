@@ -86,7 +86,7 @@ export class NlpService {
     model?: string
   ) {
     this.apiKey = apiKey ? apiKey.trim().replace(/^["']|["']$/g, '').trim() : undefined;
-    this.model = (model?.trim() || 'gemini-3.5-flash').replace(/^models\//, '');
+    this.model = (model?.trim() || 'gemini-3.1-flash-lite').replace(/^models\//, '');
   }
 
   getApiKeyStatus(): { configured: boolean; preview?: string; length?: number } {
@@ -198,7 +198,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    */
   private getCandidateModels(): string[] {
     const list = [this.model];
-    const fallbacks = ['gemini-3-flash-preview', 'gemini-3.1-flash-lite', 'gemini-flash-lite-latest'];
+    const fallbacks = ['gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-flash-lite-latest'];
     for (const fb of fallbacks) {
       if (!list.includes(fb)) {
         list.push(fb);

@@ -112,7 +112,7 @@ describe('Hono API Routes', () => {
     };
     expect(data.status).toBe('ok');
     expect(data.gemini.api_key_configured).toBe(false);
-    expect(data.gemini.model).toBe('gemini-3.5-flash');
+    expect(data.gemini.model).toBe('gemini-3.1-flash-lite');
     expect(data.database.healthy).toBe(true);
   });
 
