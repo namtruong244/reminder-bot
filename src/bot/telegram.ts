@@ -1,5 +1,6 @@
 import {
   TelegramInlineKeyboardMarkup,
+  TelegramReplyKeyboardMarkup,
   TelegramMessage,
 } from '../types/task';
 
@@ -15,7 +16,7 @@ export class TelegramApi {
     text: string,
     options?: {
       parse_mode?: 'Markdown' | 'MarkdownV2' | 'HTML';
-      reply_markup?: TelegramInlineKeyboardMarkup;
+      reply_markup?: TelegramInlineKeyboardMarkup | TelegramReplyKeyboardMarkup;
       reply_to_message_id?: number;
     }
   ): Promise<TelegramMessage | null> {
@@ -108,6 +109,42 @@ export class TelegramApi {
       return true;
     } catch (err) {
       console.error('Error editing Telegram message text:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Replaces only the inline keyboard of a message (text untouched).
+   */
+  async editMessageReplyMarkup(
+    chatId: number | string,
+    messageId: number,
+    replyMarkup: TelegramInlineKeyboardMarkup
+  ): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/editMessageReplyMarkup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: replyMarkup }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Registers the "/" command menu shown in the Telegram client.
+   */
+  async setMyCommands(commands: Array<{ command: string; description: string }>): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/setMyCommands`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ commands }),
+      });
+      return res.ok;
+    } catch {
       return false;
     }
   }

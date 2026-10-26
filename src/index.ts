@@ -128,8 +128,18 @@ app.post('/api/setup-webhook', requireAdminAuth, async (c) => {
 
   const telegram = new TelegramApi(c.env.TELEGRAM_BOT_TOKEN);
   const result = await telegram.setWebhook(webhook_url, c.env.TELEGRAM_WEBHOOK_SECRET);
+  // Populate the "/" command menu in the Telegram client
+  const menuRegistered = await telegram.setMyCommands([
+    { command: 'list', description: 'Việc đang chờ' },
+    { command: 'today', description: 'Việc hôm nay' },
+    { command: 'sync', description: 'Trạng thái đồng bộ iPhone' },
+    { command: 'timezone', description: 'Đổi múi giờ' },
+    { command: 'help', description: 'Hướng dẫn sử dụng' },
+    { command: 'debug', description: 'Kiểm tra bot và thử phân tích câu' },
+  ]);
   return c.json({
     success: result.success,
+    commands_menu_registered: menuRegistered,
     webhook_url,
     description: result.description,
     error_code: result.error_code,

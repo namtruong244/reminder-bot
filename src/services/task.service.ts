@@ -292,6 +292,29 @@ export class TaskService {
   }
 
   /**
+   * Undo for Done/Cancel: puts a closed task back to PENDING. If its reminder time already
+   * passed, it is re-armed 5 minutes from now so it does not fire instantly.
+   */
+  async restoreTask(taskId: string): Promise<TaskRecord | null> {
+    const existing = await this.getTaskById(taskId);
+    if (!existing || existing.status === 'PENDING') return existing;
+
+    const remindAt =
+      new Date(existing.remind_at).getTime() > Date.now()
+        ? existing.remind_at
+        : new Date(Date.now() + 5 * 60 * 1000).toISOString();
+
+    await this.db
+      .prepare(
+        `UPDATE tasks SET status = 'PENDING', remind_at = ?, updated_at = datetime('now')
+         WHERE id = ? AND status IN ('COMPLETED', 'CANCELLED');`
+      )
+      .bind(remindAt, taskId)
+      .run();
+    return this.getTaskById(taskId);
+  }
+
+  /**
    * Cancels a task.
    */
   async cancelTask(taskId: string): Promise<boolean> {

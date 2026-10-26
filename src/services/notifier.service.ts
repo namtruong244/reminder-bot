@@ -2,6 +2,7 @@ import { Env } from '../types/env';
 import { TelegramApi } from '../bot/telegram';
 import { TaskService } from './task.service';
 import { createReminderKeyboard } from '../bot/keyboards';
+import { renderReminderMessage, renderTaskList } from '../bot/messages';
 import {
   formatDisplayDate,
   addMinutes,
@@ -33,26 +34,7 @@ export class NotifierService {
     const deliveryResults = await Promise.allSettled(
       dueTasks.map(async (task) => {
         const tz = task.timezone || DEFAULT_TZ;
-        const isCritical = task.priority === 'CRITICAL' || task.nagging_mode === 1;
-
-        const titleHeader = isCritical
-          ? '🔔 NHẮC VIỆC [KHẨN CẤP]'
-          : '🔔 NHẮC NHỞ CÔNG VIỆC';
-
-        const safeTitle = escapeMarkdown(task.title);
-        let message = `
-${titleHeader}
-📌 Nội dung: *${safeTitle}*
-⏰ Hạn chót: *${formatDisplayDate(task.due_at, tz)}*
-        `.trim();
-
-        if (task.description) {
-          message += `\n📝 Ghi chú: ${escapeMarkdown(task.description)}`;
-        }
-
-        if (task.snooze_count > 0) {
-          message += `\n💤 Đã hoãn: ${task.snooze_count} lần`;
-        }
+        const message = renderReminderMessage(task, tz, now);
 
         const sent = await this.telegram.sendMessage(task.user_id, message, {
           parse_mode: 'Markdown',
@@ -141,21 +123,16 @@ ${titleHeader}
         const todayTasks = await this.taskService.getTodayTasks(row.user_id, row.timezone);
         if (todayTasks.length === 0) return;
 
-        let brief = `☀️ *CHÀO BUỔI SÁNG! BẢN TIN CÔNG VIỆC HÔM NAY*\n\n`;
-        brief += `Hôm nay bạn có *${todayTasks.length}* công việc cần thực hiện:\n`;
+        const view = renderTaskList(todayTasks, row.timezone, {
+          heading: '☀️ *Chào buổi sáng! Việc hôm nay*',
+          grouped: false,
+          context: 't',
+        });
 
-        for (let i = 0; i < todayTasks.length; i++) {
-          const t = todayTasks[i];
-          const icon = t.priority === 'CRITICAL' ? '🔴 [GẤP]' : '📌';
-          brief += `${i + 1}. ${icon} *${escapeMarkdown(t.title)}* (${formatDisplayDate(
-            t.due_at,
-            row.timezone
-          )})\n`;
-        }
-
-        brief += `\nChúc bạn một ngày làm việc hiệu quả! Gõ /today hoặc /list để tương tác.`;
-
-        await this.telegram.sendMessage(row.user_id, brief, { parse_mode: 'Markdown' });
+        await this.telegram.sendMessage(row.user_id, view.text, {
+          parse_mode: 'Markdown',
+          reply_markup: view.keyboard,
+        });
       })
     );
   }

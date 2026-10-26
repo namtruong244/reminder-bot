@@ -4,7 +4,9 @@ import { TelegramApi } from './telegram';
 import { TaskService } from '../services/task.service';
 import { NlpService } from '../services/nlp.service';
 import { formatDisplayDate, escapeMarkdown, DEFAULT_TZ } from '../utils/datetime';
-import { createTaskListKeyboard } from './keyboards';
+import { createMainMenuKeyboard } from './keyboards';
+import { renderTaskList, EMPTY_LIST_TEXT, EMPTY_TODAY_TEXT } from './messages';
+import { TelegramInlineKeyboardMarkup } from '../types/task';
 
 export class BotCommands {
   constructor(
@@ -62,107 +64,91 @@ export class BotCommands {
 
   private async handleStart(chatId: number): Promise<void> {
     const welcome = `
-👋 *Xin chào! Tôi là Trợ lý Nhắc việc Thông minh.*
+👋 *Chào bạn! Mình là trợ lý nhắc việc.*
 
-Tôi giúp bạn quản lý công việc và đồng bộ hai chiều với *Apple Reminders*:
-• 💬 Nhắn tự nhiên bằng tiếng Việt (VD: _"Nhắc tôi 3h chiều mai gửi hợp đồng cho khách, việc gấp"_).
-• 🔔 Tự động đẩy thông báo nhắc việc đúng giờ trên Telegram.
-• 📱 Đồng bộ hai chiều với iPhone qua iOS Shortcuts Bridge.
+Cứ nhắn tự nhiên bằng tiếng Việt, mình sẽ hiểu và nhắc đúng giờ:
+• _"3h chiều mai gửi hợp đồng, việc gấp"_
+• _"30 phút nữa tắt bếp"_
+• _"Thứ 2 và thứ 4 hàng tuần đi gym 6h sáng"_
 
-*Các lệnh nhanh:*
-/list - Xem danh sách việc chưa hoàn thành
-/today - Xem các việc cần làm hôm nay
-/sync - Trạng thái đồng bộ iOS
-/help - Xem hướng dẫn đầy đủ
+Đến giờ mình nhắn bạn kèm nút ✅ Hoàn thành hoặc 💤 Hoãn. Việc đã tạo cũng được đồng bộ sang app Lời nhắc trên iPhone.
+
+Dùng menu bên dưới để xem việc nhanh 👇
     `.trim();
 
-    await this.telegram.sendMessage(chatId, welcome, { parse_mode: 'Markdown' });
+    await this.telegram.sendMessage(chatId, welcome, {
+      parse_mode: 'Markdown',
+      reply_markup: createMainMenuKeyboard(),
+    });
   }
 
   private async handleHelp(chatId: number): Promise<void> {
     const help = `
-📖 *HƯỚNG DẪN SỬ DỤNG*
+📖 *HƯỚNG DẪN*
 
-1️⃣ *Tạo nhắc nhở:* Nhắn tin văn bản tự nhiên bằng tiếng Việt:
+*Tạo nhắc nhở* — chỉ cần nhắn như nói chuyện:
 • _"9h sáng mai họp team marketing"_
 • _"Nhắc tôi uống nước sau 30 phút nữa"_
-• _"Chiều thứ 6 lúc 17h đón con ở trường, việc gấp"_
-• _"Mỗi ngày 8h sáng uống vitamin"_
+• _"Chiều thứ 6 lúc 17h đón con, việc gấp"_
+• _"Ngày 5 hàng tháng đóng tiền nhà"_
 
-2️⃣ *Quản lý:*
-• /today: Xem việc trong ngày
-• /list: Xem 20 việc sắp tới
-• /sync: Kiểm tra đồng bộ iOS (ios_synced)
-• /timezone <múi_giờ>: Đổi múi giờ (mặc định: \`Asia/Ho_Chi_Minh\`)
-• /debug: Kiểm tra trạng thái AI Gemini, API Key và chẩn đoán NLP
-• /debug <câu nói>: Chạy thử nghiệm phân tích NLP với trace log chi tiết
+💡 Nói "việc gấp" để mình nhắc lại mỗi 10 phút đến khi bạn bấm Hoàn thành. Không nói giờ thì mình sẽ hỏi lại bằng nút chọn nhanh.
 
-3️⃣ *Đồng bộ iOS Reminders (Shortcuts):*
-• Các task tạo trên Telegram sẵn sàng kéo về app Lời nhắc của iPhone thông qua Phím tắt (Shortcuts).
-• Dùng lệnh /sync để xem số lượng task đang chờ kéo về iPhone (ios_synced = 0) và đã đồng bộ (ios_synced = 1).
+*Lệnh*
+/list — việc đang chờ
+/today — việc hôm nay
+/sync — trạng thái đồng bộ iPhone
+/timezone — đổi múi giờ (VD: \`/timezone Asia/Tokyo\`)
+/debug — kiểm tra bot và thử phân tích câu
     `.trim();
-    await this.telegram.sendMessage(chatId, help, { parse_mode: 'Markdown' });
+    await this.telegram.sendMessage(chatId, help, {
+      parse_mode: 'Markdown',
+      reply_markup: createMainMenuKeyboard(),
+    });
+  }
+
+  /**
+   * Builds the single-message list (or the friendly empty state) for /list and /today.
+   * Also used by the webhook to refresh the list in place after Done/Cancel.
+   */
+  async renderListView(
+    userId: number,
+    context: 'l' | 't'
+  ): Promise<{ text: string; keyboard?: TelegramInlineKeyboardMarkup }> {
+    const user = await this.taskService.getUser(userId);
+    const timezone = user?.timezone || DEFAULT_TZ;
+
+    if (context === 't') {
+      const tasks = await this.taskService.getTodayTasks(userId, timezone);
+      if (tasks.length === 0) return { text: EMPTY_TODAY_TEXT };
+      const view = renderTaskList(tasks, timezone, {
+        heading: '📅 *Việc hôm nay*',
+        grouped: false,
+        context: 't',
+      });
+      return { text: view.text, keyboard: view.keyboard };
+    }
+
+    const tasks = await this.taskService.getTasksByUser(userId, 'PENDING', 50);
+    if (tasks.length === 0) return { text: EMPTY_LIST_TEXT };
+    const view = renderTaskList(tasks, timezone, { heading: '📋 *Việc đang chờ*', context: 'l' });
+    return { text: view.text, keyboard: view.keyboard };
   }
 
   private async handleList(chatId: number, userId: number): Promise<void> {
-    const user = await this.taskService.getUser(userId);
-    const timezone = user?.timezone || DEFAULT_TZ;
-    const tasks = await this.taskService.getTasksByUser(userId, 'PENDING', 20);
-
-    if (tasks.length === 0) {
-      await this.telegram.sendMessage(chatId, '🎉 Bạn không có công việc nào đang chờ xử lý!');
-      return;
-    }
-
-    await this.telegram.sendMessage(
-      chatId,
-      `📋 *DANH SÁCH CÔNG VIỆC CHỜ (${tasks.length})*`,
-      { parse_mode: 'Markdown' }
-    );
-
-    for (const task of tasks) {
-      const priorityEmoji =
-        task.priority === 'CRITICAL' ? '🔴 [GẤP]' :
-        task.priority === 'HIGH' ? '🟠' :
-        task.priority === 'LOW' ? '🟢' : '🔵';
-
-      const safeTitle = escapeMarkdown(task.title);
-      const safeDesc = task.description ? escapeMarkdown(task.description) : '';
-      const syncBadge = task.ios_synced === 1 ? '🍏 iOS: Đã sync' : '⏳ iOS: Chưa sync';
-
-      const text = `
-${priorityEmoji} *${safeTitle}*
-⏰ Hạn chót: ${formatDisplayDate(task.due_at, timezone)}
-🔔 Nhắc tiếp: ${formatDisplayDate(task.remind_at, timezone)}
-${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}${safeDesc ? `📝 ${safeDesc}\n` : ''}📱 ${syncBadge}
-      `.trim();
-
-      await this.telegram.sendMessage(chatId, text, {
-        parse_mode: 'Markdown',
-        reply_markup: createTaskListKeyboard(task.id),
-      });
-    }
+    const view = await this.renderListView(userId, 'l');
+    await this.telegram.sendMessage(chatId, view.text, {
+      parse_mode: 'Markdown',
+      reply_markup: view.keyboard,
+    });
   }
 
   private async handleToday(chatId: number, userId: number): Promise<void> {
-    const user = await this.taskService.getUser(userId);
-    const timezone = user?.timezone || DEFAULT_TZ;
-    const tasks = await this.taskService.getTodayTasks(userId, timezone);
-
-    if (tasks.length === 0) {
-      await this.telegram.sendMessage(chatId, '☀️ Hôm nay bạn không có công việc nào đến hạn!');
-      return;
-    }
-
-    let message = `📅 *CÔNG VIỆC HÔM NAY (${tasks.length})*\n\n`;
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
-      const p = task.priority === 'CRITICAL' ? '🔥' : '📌';
-      const syncStatus = task.ios_synced === 1 ? '🍏' : '⏳';
-      message += `${i + 1}. ${p} *${escapeMarkdown(task.title)}* (${formatDisplayDate(task.due_at, timezone)}) [${syncStatus}]\n`;
-    }
-
-    await this.telegram.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    const view = await this.renderListView(userId, 't');
+    await this.telegram.sendMessage(chatId, view.text, {
+      parse_mode: 'Markdown',
+      reply_markup: view.keyboard,
+    });
   }
 
   private async handleSync(chatId: number, userId: number): Promise<void> {
@@ -170,19 +156,18 @@ ${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}
     const syncedCount = await this.taskService.getSyncedIosTasksCount(userId);
 
     const text = `
-📱 *TRẠNG THÁI ĐỒNG BỘ iOS REMINDERS (SHORTCUTS)*
-• Phương thức: Native Apple Reminders qua iOS Shortcuts Bridge
-• Trạng thái cột \`ios_synced\`:
-  ⏳ Đang chờ kéo về iPhone (\`ios_synced = 0\`): *${userUnsynced.length}* việc
-  ✅ Đã đồng bộ sang iPhone (\`ios_synced = 1\`): *${syncedCount}* việc
+📱 *Đồng bộ iPhone*
 
-🔗 *API Endpoints cho iOS Phím tắt (Shortcuts):*
-• Kéo việc chưa đồng bộ: \`GET /api/ios/unsynced\`
-• Báo đã đồng bộ: \`POST /api/ios/synced\` (gửi \`task_id\` hoặc \`id\`)
-• Việc đã xong/hủy trên Telegram cần đóng trên iPhone: \`GET /api/ios/closed\`, rồi \`POST /api/ios/closed\`
-• Đánh dấu hoàn thành từ iOS: \`POST /api/ios/webhook\`
+⏳ Chờ kéo về iPhone: *${userUnsynced.length}* việc
+✅ Đã có trên iPhone: *${syncedCount}* việc
 
-💡 _Mẹo: Mở app Phím tắt (Shortcuts) trên iPhone để chạy automation đồng bộ._
+Mở app *Phím tắt (Shortcuts)* trên iPhone và chạy automation để kéo các việc đang chờ vào app Lời nhắc.
+
+*Dành cho Shortcut* (gửi kèm header \`Authorization: Bearer …\`)
+• \`GET /api/ios/unsynced\` — việc chờ đồng bộ
+• \`POST /api/ios/synced\` — báo đã đồng bộ (\`task_id\`)
+• \`GET /api/ios/closed\`, \`POST /api/ios/closed\` — việc đã xong/hủy cần đóng trên iPhone
+• \`POST /api/ios/webhook\` — báo hoàn thành từ iPhone
     `.trim();
 
     await this.telegram.sendMessage(chatId, text, { parse_mode: 'Markdown' });
@@ -251,15 +236,15 @@ ${task.recurrence_rule ? `🔄 Lặp lại: \`${task.recurrence_rule}\`\n` : ''}
 🛠 *BẢNG THÔNG TIN DEBUG HỆ THỐNG*
 
 🔑 *Google Gemini AI:*
-• API Key: *${hasGeminiKey ? `✅ Đã cấu hình (\`${maskedKey}\`, độ dài: ${geminiKeyLen})` : `❌ CHƯA CẤU HÌNH / BỊ RỖNG!`}*
+• API Key: ${hasGeminiKey ? `✅ Đã cấu hình (\`${maskedKey}\`, độ dài: ${geminiKeyLen})` : '❌ *CHƯA CẤU HÌNH / BỊ RỖNG!*'}
 • Model: \`${escapeMarkdown(modelName)}\`
-${!hasGeminiKey ? `⚠️ *LƯU Ý:* Vì thiếu GEMINI_API_KEY, bot đang tự động fallback về Regex parser thuần túy! Cần chạy lệnh \`wrangler secret put GEMINI_API_KEY\` trên Cloudflare.\n` : ''}
+${!hasGeminiKey ? `⚠️ *LƯU Ý:* Vì thiếu GEMINI\\_API\\_KEY, bot đang tự động fallback về Regex parser thuần túy! Cần chạy lệnh \`wrangler secret put GEMINI_API_KEY\` trên Cloudflare.\n` : ''}
 🤖 *Telegram Bot:*
 • Bot Token: *${this.env.TELEGRAM_BOT_TOKEN ? '✅ Đã cấu hình' : '❌ Thiếu'}*
 • Webhook Secret: *${this.env.TELEGRAM_WEBHOOK_SECRET ? '✅ Đã cấu hình' : '⚪ Không bắt buộc'}*
 
 🗄 *Cloudflare D1 Database:*
-• Trạng thái: *${dbStatus}*
+• Trạng thái: *${escapeMarkdown(dbStatus)}*
 • Tổng người dùng: \`${userCount}\`
 • Tổng công việc: \`${taskCount}\`
 • Múi giờ của bạn: \`${escapeMarkdown(timezone)}\`
@@ -313,7 +298,7 @@ Ví dụ:
         trace.source === 'GEMINI'
           ? `Google Gemini AI (${trace.result.debug?.model || modelName})`
           : trace.source === 'REGEX_NO_API_KEY'
-          ? 'Regex Parser (Do GEMINI_API_KEY chưa cấu hình)'
+          ? 'Regex Parser (Do GEMINI\\_API\\_KEY chưa cấu hình)'
           : 'Regex Parser Dự Phòng (Do Gemini gọi lỗi)';
 
       const res = trace.result;

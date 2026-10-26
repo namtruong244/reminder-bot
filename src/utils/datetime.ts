@@ -389,3 +389,113 @@ export function calculateNextRecurrence(
     remindAt: nextRemindIso,
   };
 }
+
+/**
+ * Local calendar-day difference between `date` and `now` in the timezone (0 = same day).
+ */
+function localDayDiff(date: Date, now: Date, timezone: string): number {
+  const a = getLocalDateParts(date, timezone);
+  const b = getLocalDateParts(now, timezone);
+  const da = Date.UTC(a.year, a.month - 1, a.day);
+  const db = Date.UTC(b.year, b.month - 1, b.day);
+  return Math.round((da - db) / 86400000);
+}
+
+/** "HH:MM" in the user's timezone. */
+export function formatTimeOnly(isoString: string, timezone: string = DEFAULT_TZ): string {
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) return isoString;
+  const p = getLocalDateParts(date, timezone);
+  return `${p.hour.toString().padStart(2, '0')}:${p.minute.toString().padStart(2, '0')}`;
+}
+
+/**
+ * Day label only: "Hôm nay", "Ngày mai", "Ngày mốt", "Thứ Sáu 30/10", "20/12", "20/12/2027".
+ */
+export function formatDayLabel(
+  isoString: string,
+  timezone: string = DEFAULT_TZ,
+  now: Date = new Date()
+): string {
+  const date = new Date(isoString);
+  if (isNaN(date.getTime())) return isoString;
+
+  const diff = localDayDiff(date, now, timezone);
+  if (diff === 0) return 'Hôm nay';
+  if (diff === 1) return 'Ngày mai';
+  if (diff === 2) return 'Ngày mốt';
+  if (diff === -1) return 'Hôm qua';
+
+  const p = getLocalDateParts(date, timezone);
+  const dd = p.day.toString().padStart(2, '0');
+  const mm = p.month.toString().padStart(2, '0');
+  if (diff >= 3 && diff <= 6) {
+    return `${getVietnameseDayOfWeek(date, timezone)} ${dd}/${mm}`;
+  }
+  const sameYear = p.year === getLocalDateParts(now, timezone).year;
+  return `${dd}/${mm}${sameYear ? '' : `/${p.year}`}`;
+}
+
+/**
+ * Human-friendly date: "Hôm nay 15:00", "Ngày mai 09:00", "Thứ Sáu 30/10 09:00", "20/12 09:00".
+ */
+export function formatFriendlyDate(
+  isoString: string,
+  timezone: string = DEFAULT_TZ,
+  now: Date = new Date()
+): string {
+  if (isNaN(new Date(isoString).getTime())) return isoString;
+  return `${formatDayLabel(isoString, timezone, now)} ${formatTimeOnly(isoString, timezone)}`;
+}
+
+/** "còn 15 phút", "còn 2 giờ 5 phút", "còn 3 ngày", "quá hạn 10 phút". */
+export function formatCountdown(isoString: string, now: Date = new Date()): string {
+  const target = new Date(isoString).getTime();
+  if (isNaN(target)) return '';
+  const diffMin = Math.round((target - now.getTime()) / 60000);
+  const abs = Math.abs(diffMin);
+  const prefix = diffMin < 0 ? 'quá hạn' : 'còn';
+
+  if (abs < 1) return 'ngay bây giờ';
+  if (abs < 60) return `${prefix} ${abs} phút`;
+  if (abs < 24 * 60) {
+    const h = Math.floor(abs / 60);
+    const m = abs % 60;
+    return `${prefix} ${h} giờ${m ? ` ${m} phút` : ''}`;
+  }
+  const days = Math.floor(abs / (24 * 60));
+  const hours = Math.floor((abs % (24 * 60)) / 60);
+  // Under 2 days a bare "1 ngày" is vague, so keep the hours
+  return days < 2 && hours > 0 ? `${prefix} ${days} ngày ${hours} giờ` : `${prefix} ${days} ngày`;
+}
+
+/** Turns an RRULE into Vietnamese: "Hàng tuần: Thứ 2, Thứ 4". Unknown rules are returned as-is. */
+export function describeRecurrence(rrule: string): string {
+  const r = rrule.toUpperCase();
+  const freq = r.match(/FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)/)?.[1];
+  const interval = parseInt(r.match(/INTERVAL=(\d+)/)?.[1] ?? '1', 10) || 1;
+  const names: Record<string, string> = {
+    MO: 'Thứ 2', TU: 'Thứ 3', WE: 'Thứ 4', TH: 'Thứ 5', FR: 'Thứ 6', SA: 'Thứ 7', SU: 'Chủ nhật',
+  };
+
+  switch (freq) {
+    case 'DAILY':
+      return interval > 1 ? `Mỗi ${interval} ngày` : 'Hàng ngày';
+    case 'WEEKLY': {
+      const days = (r.match(/BYDAY=([A-Z,]+)/)?.[1] ?? '')
+        .split(',')
+        .map((d) => names[d])
+        .filter(Boolean);
+      const base = interval > 1 ? `Mỗi ${interval} tuần` : 'Hàng tuần';
+      return days.length ? `${base}: ${days.join(', ')}` : base;
+    }
+    case 'MONTHLY': {
+      const day = r.match(/BYMONTHDAY=(\d+)/)?.[1];
+      return day ? `Ngày ${day} hàng tháng` : interval > 1 ? `Mỗi ${interval} tháng` : 'Hàng tháng';
+    }
+    case 'YEARLY':
+      return 'Hàng năm';
+    default:
+      return rrule;
+  }
+}

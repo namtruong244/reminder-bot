@@ -1,15 +1,22 @@
 import { Context } from 'hono';
 import { Env } from '../types/env';
-import { TaskRecord, TelegramUpdate, UserRecord } from '../types/task';
+import { TaskRecord, TelegramInlineKeyboardMarkup, TelegramUpdate } from '../types/task';
 import { TelegramApi } from './telegram';
 import { TaskService } from '../services/task.service';
 import { BotCommands } from './commands';
 import { NlpService } from '../services/nlp.service';
-import { createTaskCreatedKeyboard } from './keyboards';
+import {
+  createTaskCreatedKeyboard,
+  createReschedKeyboard,
+  createUndoKeyboard,
+  MENU_COMMANDS,
+} from './keyboards';
+import { renderCreatedMessage, renderTaskCard } from './messages';
 import {
   toUtcIso,
   addMinutes,
-  formatDisplayDate,
+  formatFriendlyDate,
+  formatTimeOnly,
   calculateNextRecurrence,
   getTomorrowMorningIso,
   getLocalDateParts,
@@ -127,13 +134,12 @@ export class TelegramWebhookHandler {
       }
     } catch (err) {
       console.error('Unhandled error in Telegram webhook handler:', err);
-      const errorMsg = err instanceof Error ? err.message : String(err);
       const chatId = update.message?.chat.id || update.callback_query?.message?.chat.id;
       if (chatId) {
         try {
           await this.telegram.sendMessage(
             chatId,
-            `⚠️ *Lỗi xử lý:* \`${escapeMarkdown(errorMsg)}\`\n\nVui lòng thử lại hoặc gõ /start để khởi tạo.`,
+            `😵 *Có lỗi xảy ra khi xử lý yêu cầu.*\n\nBạn thử gửi lại giúp mình nhé. Nếu vẫn lỗi, gõ /start để khởi tạo lại.`,
             { parse_mode: 'Markdown' }
           );
         } catch {
@@ -165,6 +171,13 @@ export class TelegramWebhookHandler {
 
     // Send instant typing action so user knows bot is working immediately
     this.safeWaitUntil(c, this.telegram.sendChatAction(chatId, 'typing'));
+
+    // Persistent bottom-menu buttons arrive as plain text; map them to commands
+    const menuCommand = MENU_COMMANDS[text];
+    if (menuCommand) {
+      await this.commands.handleCommand({ ...message, text: menuCommand });
+      return;
+    }
 
     // Check if it is a bot command
     if (text.startsWith('/')) {
@@ -219,7 +232,7 @@ export class TelegramWebhookHandler {
       if (dueMs < nowMs - 60_000) {
         await this.telegram.sendMessage(
           chatId,
-          `⚠️ Thời điểm tôi hiểu được là *${formatDisplayDate(dueAtUtc, tz)}* — đã qua rồi. Bạn nhắn lại kèm ngày giờ cụ thể giúp tôi nhé (ví dụ: _"9h sáng mai ..."_).`,
+          `⚠️ Thời điểm mình hiểu được là *${formatFriendlyDate(dueAtUtc, tz)}* — đã qua rồi. Bạn nhắn lại kèm ngày giờ cụ thể giúp mình nhé (ví dụ: _"9h sáng mai ..."_).`,
           { parse_mode: 'Markdown' }
         );
         return;
@@ -252,41 +265,10 @@ export class TelegramWebhookHandler {
         recurrence_rule: nlpResult.recurrence_rrule,
       });
 
-      // Format confirmation response
-      const priorityLabel =
-        priority === 'CRITICAL' ? '🔴 KHẨN CẤP' :
-        priority === 'HIGH' ? '🟠 CAO' :
-        priority === 'LOW' ? '🟢 THẤP' : '🔵 TRUNG BÌNH';
-
-      let confirmText = `
-✅ *Đã tạo nhắc nhở thành công!*
-
-📌 Tiêu đề: *${escapeMarkdown(createdTask.title)}*
-⏰ Hạn chót: *${formatDisplayDate(createdTask.due_at, tz)}*
-🔔 Nhắc lúc: *${formatDisplayDate(createdTask.remind_at, tz)}*
-⚡ Mức độ: *${priorityLabel}*
-      `.trim();
-
-      if (createdTask.recurrence_rule) {
-        confirmText += `\n🔄 Lặp lại: \`${createdTask.recurrence_rule}\``;
-      }
-      if (nagging === 1) {
-        confirmText += `\n⚠️ Chế độ nhắc liên tục (mỗi 10 phút) đã được kích hoạt.`;
-      }
-      if (nlpResult.time_assumed) {
-        confirmText += `\n\n❓ _Tin nhắn chưa nói rõ giờ nên tôi tạm đặt sau 30 phút. Bấm nút bên dưới để chỉnh nhanh._`;
-      }
-      confirmText += `\n📱 _iOS: Đang chờ đồng bộ (ios_synced: 0)_`;
-
-      if (nlpResult.debug) {
-        if (nlpResult.debug.source === 'GEMINI') {
-          confirmText += `\n\n🤖 _Phân tích bởi: Gemini ${nlpResult.debug.model || 'Flash'} (${nlpResult.debug.latency_ms || 0}ms)_`;
-        } else if (nlpResult.debug.source === 'REGEX_NO_API_KEY') {
-          confirmText += `\n\n⚠️ _Phân tích bởi: Regex (Lý do: Chưa cài đặt GEMINI_API_KEY trên Cloudflare Secrets! Dùng /debug để xem hướng dẫn)_`;
-        } else {
-          confirmText += `\n\n⚠️ _Phân tích bởi: Regex dự phòng (Lỗi Gemini: ${escapeMarkdown(nlpResult.debug.error || 'Timeout/Error')})_`;
-        }
-      }
+      const confirmText = renderCreatedMessage(createdTask, tz, {
+        timeAssumed: !!nlpResult.time_assumed,
+        aiFallback: !!nlpResult.debug && nlpResult.debug.source !== 'GEMINI',
+      });
 
       await this.telegram.sendMessage(chatId, confirmText, {
         parse_mode: 'Markdown',
@@ -296,16 +278,31 @@ export class TelegramWebhookHandler {
     }
 
     // Default response if prompt could not be parsed into a task
-    let failMsg = `Tôi chưa hiểu rõ yêu cầu nhắc việc của bạn. Hãy thử nhắn rõ thời gian, ví dụ:\n• _"9h sáng mai họp với phòng kinh doanh"_\n• _"Nhắc tôi uống thuốc sau 15 phút nữa, việc gấp"_`;
-    if (nlpResult.debug) {
-      if (nlpResult.debug.source === 'REGEX_NO_API_KEY') {
-        failMsg += `\n\n⚠️ _[Debug] Chưa cấu hình GEMINI_API_KEY trên Cloudflare Secrets! Bot đang chạy Regex dự phòng._`;
-      } else if (nlpResult.debug.error) {
-        failMsg += `\n\n🔍 _[Debug] Lỗi Gemini: ${escapeMarkdown(nlpResult.debug.error)}_`;
-      }
+    let failMsg = `🤔 *Mình chưa hiểu bạn muốn nhắc việc gì.*\n\nHãy nhắn kèm thời gian, ví dụ:\n• _"9h sáng mai họp với phòng kinh doanh"_\n• _"Nhắc tôi uống thuốc sau 15 phút nữa, việc gấp"_`;
+    if (nlpResult.debug && nlpResult.debug.source !== 'GEMINI') {
+      failMsg += `\n\n⚠️ _AI đang bận nên mình chỉ dùng bộ phân tích dự phòng. Bạn thử lại sau ít phút nhé._`;
     }
 
     await this.telegram.sendMessage(chatId, failMsg, { parse_mode: 'Markdown' });
+  }
+
+  /**
+   * Loads a task and verifies the tapping user owns it; answers the callback with a toast otherwise.
+   */
+  private async loadOwnedTask(
+    query: NonNullable<TelegramUpdate['callback_query']>,
+    taskId: string | undefined
+  ): Promise<TaskRecord | null> {
+    const task = taskId ? await this.taskService.getTaskById(taskId) : null;
+    if (!task) {
+      await this.telegram.answerCallbackQuery(query.id, 'Công việc không còn tồn tại.');
+      return null;
+    }
+    if (task.user_id !== query.from.id) {
+      await this.telegram.answerCallbackQuery(query.id, 'Bạn không có quyền thao tác trên công việc này.', true);
+      return null;
+    }
+    return task;
   }
 
   private async handleCallbackQuery(
@@ -321,123 +318,140 @@ export class TelegramWebhookHandler {
     const chatId = query.message?.chat.id || query.from.id;
     const messageId = query.message?.message_id;
     const parts = data.split(':');
-    const [action, subAction, paramId] = parts;
+    const [action, subAction] = parts;
 
     if (action !== 'action') {
       await this.telegram.answerCallbackQuery(query.id);
       return;
     }
 
+    // done/cancel/edit/back/undo: action:{sub}:{id}[:ctx]; snooze/resched: action:{sub}:{arg}:{id}
+    const hasArg = subAction === 'snooze' || subAction === 'resched';
+    const taskId = hasArg ? parts[3] : parts[2];
+    const arg = hasArg ? parts[2] : undefined;
+    const listContext = !hasArg && (parts[3] === 'l' || parts[3] === 't') ? (parts[3] as 'l' | 't') : null;
+
     const user = await this.taskService.getUser(query.from.id);
     const tz = user?.timezone || DEFAULT_TZ;
 
+    const task = await this.loadOwnedTask(query, taskId);
+    if (!task) return;
+
+    const show = async (text: string, replyMarkup?: TelegramInlineKeyboardMarkup) => {
+      if (messageId) {
+        await this.telegram.editMessageText(chatId, messageId, text, {
+          parse_mode: 'Markdown',
+          reply_markup: replyMarkup,
+        });
+      }
+    };
+
+    /** Redraws the list the tap came from (keeps the user in the list instead of replacing it). */
+    const refreshList = async (ctx: 'l' | 't') => {
+      const view = await this.commands.renderListView(query.from.id, ctx);
+      await show(view.text, view.keyboard);
+    };
+
+    const toast = (text: string) =>
+      this.telegram.answerCallbackQuery(query.id, text.length > 120 ? `${text.slice(0, 117)}…` : text);
+
+    // Inline keyboard shortcuts that never change data
+    if (subAction === 'edit') {
+      if (messageId) await this.telegram.editMessageReplyMarkup(chatId, messageId, createReschedKeyboard(task.id));
+      await this.telegram.answerCallbackQuery(query.id, 'Chọn giờ mới');
+      return;
+    }
+    if (subAction === 'back') {
+      if (messageId) await this.telegram.editMessageReplyMarkup(chatId, messageId, createTaskCreatedKeyboard(task.id));
+      await this.telegram.answerCallbackQuery(query.id);
+      return;
+    }
+
+    if (subAction === 'undo') {
+      if (task.status === 'PENDING') {
+        await toast('Việc này đang hoạt động rồi.');
+        return;
+      }
+      const restored = await this.taskService.restoreTask(task.id);
+      if (restored) {
+        await show(`↩️ *Đã khôi phục*\n\n${renderTaskCard(restored, tz)}`, createTaskCreatedKeyboard(restored.id));
+      }
+      await toast('Đã khôi phục công việc');
+      return;
+    }
+
+    // Everything below only makes sense for open tasks (also makes double taps harmless)
+    if (task.status !== 'PENDING') {
+      await toast(task.status === 'COMPLETED' ? 'Việc này đã hoàn thành rồi.' : 'Việc này đã bị hủy.');
+      return;
+    }
+
     if (subAction === 'done') {
-      const taskId = paramId;
-      const task = await this.taskService.getTaskById(taskId);
-
-      if (!task) {
-        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
-        return;
-      }
-
-      if (task.user_id !== query.from.id) {
-        await this.telegram.answerCallbackQuery(
-          query.id,
-          'Bạn không có quyền thao tác trên công việc này!',
-          true
-        );
-        return;
-      }
-
-      const safeTitle = escapeMarkdown(task.title);
-
       if (task.recurrence_rule) {
-        // Calculate next recurrence for recurring tasks in user's timezone
         const next = calculateNextRecurrence(task.due_at, task.remind_at, task.recurrence_rule, tz);
-        await this.taskService.completeTask(taskId, next);
-
-        if (messageId) {
-          const editMsg = `✅ *Đã hoàn thành lần này!*\n📌 ${safeTitle}\n⏰ Lần nhắc kế tiếp: *${formatDisplayDate(next.remindAt, tz)}*`;
-          await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
+        await this.taskService.completeTask(task.id, next);
+        if (listContext) {
+          await refreshList(listContext);
+        } else {
+          await show(
+            `✅ *Xong lần này*\n📌 ${escapeMarkdown(task.title)}\n🔄 Lần kế tiếp: ${formatFriendlyDate(next.dueAt, tz)}`
+          );
         }
-      } else {
-        await this.taskService.completeTask(taskId);
-
-        if (messageId) {
-          const editMsg = `✅ *Đã hoàn thành:* ${safeTitle} (lúc ${formatDisplayDate(new Date().toISOString(), tz)})`;
-          await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
-        }
+        await toast(`Đã xong lần này · kế tiếp ${formatFriendlyDate(next.dueAt, tz)}`);
+        return;
       }
 
-      await this.telegram.answerCallbackQuery(query.id, 'Đã ghi nhận hoàn thành!');
+      await this.taskService.completeTask(task.id);
+      if (listContext) {
+        await refreshList(listContext);
+      } else {
+        await show(
+          `✅ *Đã hoàn thành lúc ${formatTimeOnly(new Date().toISOString(), tz)}*\n📌 ${escapeMarkdown(task.title)}`,
+          createUndoKeyboard(task.id)
+        );
+      }
+      await toast(`✅ Đã xong: ${task.title}`);
+      return;
+    }
+
+    if (subAction === 'cancel') {
+      await this.taskService.cancelTask(task.id);
+      if (listContext) {
+        await refreshList(listContext);
+      } else {
+        await show(`🗑 *Đã hủy nhắc việc*\n📌 ${escapeMarkdown(task.title)}`, createUndoKeyboard(task.id));
+      }
+      await toast(`🗑 Đã hủy: ${task.title}`);
       return;
     }
 
     if (subAction === 'snooze') {
-      // Format: action:snooze:{minutes|tomorrow}:{taskId}
-      const snoozeArg = paramId;
-      const taskId = parts[3];
-      const task = await this.taskService.getTaskById(taskId);
-
-      if (!task) {
-        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
-        return;
-      }
-
-      if (task.user_id !== query.from.id) {
-        await this.telegram.answerCallbackQuery(
-          query.id,
-          'Bạn không có quyền thao tác trên công việc này!',
-          true
-        );
-        return;
-      }
-
       let newRemindAt: string;
-      let snoozeNote: string;
-
-      if (snoozeArg === 'tomorrow') {
+      let note: string;
+      if (arg === 'tomorrow') {
         newRemindAt = getTomorrowMorningIso(tz, 9, 0);
-        snoozeNote = 'đến 09:00 sáng mai';
+        note = 'đến 9:00 sáng mai';
       } else {
-        const mins = parseInt(snoozeArg, 10) || 15;
+        const mins = parseInt(arg ?? '', 10) || 15;
         newRemindAt = addMinutes(new Date(), mins);
-        snoozeNote = `thêm ${mins} phút`;
+        note = mins >= 60 && mins % 60 === 0 ? `${mins / 60} giờ` : `${mins} phút`;
       }
 
-      await this.taskService.snoozeTask(taskId, newRemindAt);
-
-      if (messageId) {
-        const editMsg = `💤 *Đã hoãn nhắc nhở ${snoozeNote}*\n📌 *${escapeMarkdown(task.title)}*\n⏰ Sẽ nhắc lại vào: *${formatDisplayDate(newRemindAt, tz)}*`;
-        await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
-      }
-
-      await this.telegram.answerCallbackQuery(query.id, `Đã hoãn ${snoozeNote}`);
+      await this.taskService.snoozeTask(task.id, newRemindAt);
+      await show(
+        `💤 *Đã hoãn ${note}*\n📌 ${escapeMarkdown(task.title)}\n⏰ Nhắc lại: ${formatFriendlyDate(newRemindAt, tz)}`
+      );
+      await toast(`Đã hoãn ${note}`);
       return;
     }
 
     if (subAction === 'resched') {
-      // Format: action:resched:{1h|tonight|tomorrow}:{taskId}
-      const taskId = parts[3];
-      const task = await this.taskService.getTaskById(taskId);
-
-      if (!task) {
-        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
-        return;
-      }
-      if (task.user_id !== query.from.id) {
-        await this.telegram.answerCallbackQuery(query.id, 'Bạn không có quyền thao tác trên công việc này!', true);
-        return;
-      }
-      if (task.status !== 'PENDING') {
-        await this.telegram.answerCallbackQuery(query.id, 'Công việc đã đóng, không thể đổi giờ.');
-        return;
-      }
-
       let newDue: string;
-      if (paramId === 'tomorrow') {
+      if (arg === 'tomorrow') {
         newDue = getTomorrowMorningIso(tz, 9, 0);
-      } else if (paramId === 'tonight') {
+      } else if (arg === 'tomorrow14') {
+        newDue = getTomorrowMorningIso(tz, 14, 0);
+      } else if (arg === 'tonight') {
         const today = getLocalDateParts(new Date(), tz);
         const iso = `${today.year}-${String(today.month).padStart(2, '0')}-${String(today.day).padStart(2, '0')}T20:00:00${getTimezoneOffsetString(new Date(), tz)}`;
         newDue = toUtcIso(iso, tz);
@@ -447,45 +461,11 @@ export class TelegramWebhookHandler {
         newDue = addMinutes(new Date(), 60);
       }
 
-      await this.taskService.rescheduleTask(taskId, newDue);
-
-      if (messageId) {
-        const editMsg = `✏️ *Đã đổi giờ nhắc*\n📌 *${escapeMarkdown(task.title)}*\n⏰ Hạn chót mới: *${formatDisplayDate(newDue, tz)}*`;
-        await this.telegram.editMessageText(chatId, messageId, editMsg, {
-          parse_mode: 'Markdown',
-          reply_markup: createTaskCreatedKeyboard(taskId),
-        });
+      const updated = await this.taskService.rescheduleTask(task.id, newDue);
+      if (updated) {
+        await show(`✏️ *Đã đổi giờ*\n\n${renderTaskCard(updated, tz)}`, createTaskCreatedKeyboard(updated.id));
       }
-      await this.telegram.answerCallbackQuery(query.id, 'Đã cập nhật giờ!');
-      return;
-    }
-
-    if (subAction === 'cancel') {
-      const taskId = paramId;
-      const task = await this.taskService.getTaskById(taskId);
-
-      if (!task) {
-        await this.telegram.answerCallbackQuery(query.id, 'Công việc không tồn tại!');
-        return;
-      }
-
-      if (task.user_id !== query.from.id) {
-        await this.telegram.answerCallbackQuery(
-          query.id,
-          'Bạn không có quyền thao tác trên công việc này!',
-          true
-        );
-        return;
-      }
-
-      await this.taskService.cancelTask(taskId);
-
-      if (messageId) {
-        const editMsg = `🗑 *Đã hủy nhắc việc:* ~${escapeMarkdown(task.title)}~`;
-        await this.telegram.editMessageText(chatId, messageId, editMsg, { parse_mode: 'Markdown' });
-      }
-
-      await this.telegram.answerCallbackQuery(query.id, 'Đã hủy công việc!');
+      await toast(`Đã đổi sang ${formatFriendlyDate(newDue, tz)}`);
       return;
     }
 
