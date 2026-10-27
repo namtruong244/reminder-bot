@@ -26,6 +26,8 @@ describe('NlpService regex parser (fixed clock)', () => {
   }> = [
     { text: 'Nhắc tôi 3h chiều mai gửi hợp đồng cho khách, việc gấp nhé', due: '2026-10-27T15:00:00+07:00', title: 'gửi hợp đồng cho khách', priority: 'CRITICAL' },
     { text: 'thứ 6 tuần sau 9h họp', due: '2026-11-06T09:00:00+07:00', title: 'họp' },
+    { text: 'Họp sáng thứ 6 tuần sau lúc 9H', due: '2026-11-06T09:00:00+07:00', title: 'Họp' },
+    { text: 'Lúc 15H30 gọi khách', due: '2026-10-26T15:30:00+07:00', title: 'gọi khách' },
     { text: '7h tối thứ 6 đi ăn cưới', due: '2026-10-30T19:00:00+07:00', title: 'đi ăn cưới' },
     { text: '1h trưa họp', due: '2026-10-26T13:00:00+07:00', title: 'họp' },
     { text: '12h trưa ăn cơm', due: '2026-10-26T12:00:00+07:00', title: 'ăn cơm' },
@@ -88,6 +90,36 @@ describe('Gemini output sanitizing', () => {
     mockGemini({ intent: 'CREATE_TASK', title: 'Họp (20-06T:00+) họp', due_at_iso: '2026-11-06T09:00:00+07:00' });
     const r = await new NlpService('k').parseUserPrompt('thứ 6 tuần sau 9h họp');
     expect(r.title).toBe('Họp');
+  });
+
+  it('corrects a model that reads "thứ 6 tuần sau" as this week\'s Friday (said on Monday)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(NOW)); // Mon 2026-10-26
+    mockGemini({ intent: 'CREATE_TASK', title: 'Họp', due_at_iso: '2026-10-30T09:00:00+07:00' });
+    const r = await new NlpService('k').parseUserPrompt('Họp sáng thứ 6 tuần sau lúc 9H');
+    expect(r.due_at_iso).toBe('2026-11-06T09:00:00+07:00');
+
+    // Model's clock time is kept; only the calendar date is corrected
+    mockGemini({ intent: 'CREATE_TASK', title: 'Họp', due_at_iso: '2026-10-30T09:30:00+07:00' });
+    const r2 = await new NlpService('k').parseUserPrompt('thứ 6 tuần tới 9h30 họp');
+    expect(r2.due_at_iso).toBe('2026-11-06T09:30:00+07:00');
+
+    // A correct model answer is left untouched
+    mockGemini({ intent: 'CREATE_TASK', title: 'Họp', due_at_iso: '2026-11-06T09:00:00+07:00' });
+    const r3 = await new NlpService('k').parseUserPrompt('Họp sáng thứ 6 tuần sau lúc 9H');
+    expect(r3.due_at_iso).toBe('2026-11-06T09:00:00+07:00');
+  });
+
+  it('labels weeks (Monday start) in the calendar table sent to the model', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(NOW)); // Mon 2026-10-26
+    const spy = mockGemini({ intent: 'CREATE_TASK', title: 'Họp', due_at_iso: '2026-11-06T09:00:00+07:00' });
+    await new NlpService('k').parseUserPrompt('thứ 6 tuần sau 9h họp');
+    const body = String(spy.mock.calls[0][1]?.body);
+    expect(body).toContain('2026-10-30: Thứ Sáu [tuần này]');
+    expect(body).toContain('2026-11-01: Chủ Nhật [tuần này]');
+    expect(body).toContain('2026-11-02: Thứ Hai [tuần sau]');
+    expect(body).toContain('2026-11-06: Thứ Sáu [tuần sau]');
   });
 
   it('drops an invalid RRULE and keeps a valid one', async () => {

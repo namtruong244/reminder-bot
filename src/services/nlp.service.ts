@@ -42,6 +42,12 @@ const CRITICAL_STRIP_RE = new RegExp(CRITICAL_SRC, 'gi');
 
 const WEEKDAY_SRC = 'thứ\\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\\s*nhật';
 
+// Week-relative date phrases ("thứ 6 tuần sau", "đầu tuần tới") that the deterministic parser resolves exactly
+const WEEK_RELATIVE_DATE_RE = new RegExp(
+  `(?:${WEEKDAY_SRC})\\s+tuần\\s+(?:sau|tới|này)|đầu\\s+tuần\\s+(?:sau|tới)`,
+  'iu'
+);
+
 const VALID_RRULE_RE = /^FREQ=(?:DAILY|WEEKLY|MONTHLY|YEARLY)(?:;[A-Z]+=[A-Z0-9,+-]+)*$/;
 
 const NLP_TOTAL_BUDGET_MS = 20000;
@@ -147,7 +153,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    - "Mai", "trưa mai", "sáng mai", "chiều mai", "tối mai": ngày hiện tại + 1 ngày.
      VD: "trưa mai làm báo cáo" -> ngày mai lúc 12:00:00${tzOffset}, title: "Làm báo cáo".
    - "Mốt", "ngày kia", "trưa mốt", "sáng mốt", "chiều mốt", "tối mốt": ngày hiện tại + 2 ngày.
-   - "Thứ X tuần sau": Tính đúng ngày Thứ X của tuần kế tiếp (Tuần bắt đầu từ Thứ Hai). "Thứ X" không kèm "tuần sau": ngày Thứ X gần nhất sắp tới.
+   - "Thứ X tuần sau" / "Thứ X tuần tới": ngày Thứ X có nhãn [tuần sau] trong bảng lịch (Tuần bắt đầu từ Thứ Hai), KHÔNG phải Thứ X gần nhất của [tuần này]. "Thứ X tuần này": ngày Thứ X có nhãn [tuần này]. "Thứ X" không kèm "tuần": ngày Thứ X gần nhất sắp tới.
    - "X ngày nữa", "sau X ngày": ngày hiện tại + X ngày. "Đầu tuần sau": Thứ Hai tuần sau. "Cuối tuần": Thứ Bảy gần nhất. "Cuối tháng": ngày cuối cùng của tháng hiện tại.
    - Giờ "kém": "9h kém 15" = 08:45. "Rưỡi" = :30. "Khuya"/"đêm": 23:00 nếu không nói giờ.
    - Nếu chỉ nói ngày mà không nói giờ: mặc định 09:00:00.
@@ -183,12 +189,17 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
   private buildCalendarTable(now: Date, timezone: string): string {
     const rows: string[] = [];
     const labels = ['Hôm nay', 'Ngày mai', 'Ngày mốt'];
+    // Weeks start on Monday; label each row so "tuần sau" never has to be inferred by the model
+    const weekLabels = ['tuần này', 'tuần sau', 'tuần sau nữa'];
+    const { weekdayShort } = getLocalDateParts(now, timezone);
+    const daysFromMonday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].indexOf(weekdayShort);
     for (let i = 0; i < 15; i++) {
       const d = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
       const p = getLocalDateParts(d, timezone);
       const iso = `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
       const label = labels[i] ? ` (${labels[i]})` : '';
-      rows.push(`- ${iso}: ${getVietnameseDayOfWeek(d, timezone)}${label}`);
+      const week = weekLabels[Math.floor((Math.max(daysFromMonday, 0) + i) / 7)];
+      rows.push(`- ${iso}: ${getVietnameseDayOfWeek(d, timezone)} [${week}]${label}`);
     }
     return rows.join('\n');
   }
@@ -646,6 +657,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
           parsed.due_at_iso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
           parsed.time_assumed = true;
         }
+      } else if (WEEK_RELATIVE_DATE_RE.test(text)) {
+        // Models confuse "thứ 6 tuần sau" with the nearest Friday (esp. early in the week);
+        // the regex parser computes the calendar date exactly, so keep the model's clock time on that date.
+        parsed.due_at_iso = this.alignDateWithRegex(parsed.due_at_iso, text, currentIso, timezone);
       }
 
       if (parsed.recurrence_rrule && !VALID_RRULE_RE.test(parsed.recurrence_rrule.trim().toUpperCase())) {
@@ -695,6 +710,30 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     }
 
     return parsed;
+  }
+
+  /**
+   * Moves a model-provided due time onto the calendar date resolved by the deterministic parser,
+   * preserving the model's local time of day. Returns the input unchanged if the parser finds no date.
+   */
+  private alignDateWithRegex(
+    dueIso: string,
+    text: string,
+    currentIso: string,
+    timezone: string
+  ): string {
+    const regexDue = this.fastPatternParse(text, currentIso)?.due_at_iso;
+    if (!regexDue) return dueIso;
+    const model = getLocalDateParts(new Date(dueIso), timezone);
+    const target = getLocalDateParts(new Date(regexDue), timezone);
+    const dayDiff = Math.round(
+      (Date.UTC(target.year, target.month - 1, target.day) -
+        Date.UTC(model.year, model.month - 1, model.day)) /
+        (24 * 60 * 60 * 1000)
+    );
+    if (dayDiff === 0) return dueIso;
+    console.warn(`[NLP-DEBUG] ⚠️ Correcting model date ${dueIso} by ${dayDiff} day(s) to match "${text}"`);
+    return getNowWithTimezone(new Date(new Date(dueIso).getTime() + dayDiff * 24 * 60 * 60 * 1000), timezone);
   }
 
   /**
@@ -1338,7 +1377,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       .replace(/\d+\s*(?:phút|p|tiếng|giờ|h|ngày)(?!\p{L})\s*nữa/giu, '')
       .replace(/nửa\s+(?:tiếng|giờ)\s*(?:nữa)?/gi, '')
       // 9. Remove 24h format: "16h30", "lúc 15h" — require h/: not immediately followed by letter
-      .replace(/(?:lúc\s+)?\d{1,2}\s*(?:h(?!\p{L})|giờ(?!\p{L})|:)\s*\d{0,2}/gu, '')
+      .replace(/(?:lúc\s+)?\d{1,2}\s*(?:h(?!\p{L})|giờ(?!\p{L})|:)\s*\d{0,2}/giu, '')
       // 11. Remove priority words and filler words ("việc gấp", "nhé")
       .replace(CRITICAL_STRIP_RE, '')
       .replace(/(?:^|\s)(?:nhé|nha)\s*[.!]*$/i, '')
