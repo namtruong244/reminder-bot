@@ -5,6 +5,9 @@ import {
   getDaysInMonth,
   getLocalDateParts,
   calculateNextRecurrence,
+  daysSinceMonday,
+  toUtcIso,
+  zonedTimeToIso,
   DEFAULT_TZ,
 } from '../utils/datetime';
 
@@ -40,13 +43,46 @@ const CRITICAL_SRC =
 const CRITICAL_RE = new RegExp(CRITICAL_SRC, 'i');
 const CRITICAL_STRIP_RE = new RegExp(CRITICAL_SRC, 'gi');
 
-const WEEKDAY_SRC = 'thứ\\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\\s*nhật';
+// "mũi thứ 2", "lần thứ 3", "con thứ 2" are ordinals, not weekdays
+const ORDINAL_LB =
+  '(?<!(?:mũi|đợt|lần|kỳ|kì|buổi|bài|vòng|tập|người|số|hạng|phần|chương|tầng|giải|con|đứa|cháu|khóa|khoá|lớp)\\s+)';
+const WEEKDAY_SRC = `${ORDINAL_LB}thứ\\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\\s*nhật`;
+// Same, capturing the day word ("hai", "6"; undefined for Sunday)
+const WEEKDAY_CODE_RE = new RegExp(`${ORDINAL_LB}thứ\\s+(hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\\s*nhật`, 'gu');
 
-// Week-relative date phrases ("thứ 6 tuần sau", "đầu tuần tới") that the deterministic parser resolves exactly
-const WEEK_RELATIVE_DATE_RE = new RegExp(
-  `(?:${WEEKDAY_SRC})\\s+tuần\\s+(?:sau|tới|này)|đầu\\s+tuần\\s+(?:sau|tới)`,
-  'iu'
+// JS weekday index (0 = Sunday) of each spoken weekday, keyed by the lowercased phrase with single spaces
+const WEEKDAY_INDEX: Record<string, number> = {
+  'chủ nhật': 0,
+  'chủnhật': 0,
+  'thứ hai': 1, 'thứ 2': 1,
+  'thứ ba': 2, 'thứ 3': 2,
+  'thứ tư': 3, 'thứ 4': 3,
+  'thứ năm': 4, 'thứ 5': 4,
+  'thứ sáu': 5, 'thứ 6': 5,
+  'thứ bảy': 6, 'thứ 7': 6,
+};
+
+// The model's due date is only corrected for SIMPLE sentences: exactly one "thứ X tuần sau/tới (nữa)" (or a
+// bare "đầu tuần sau (nữa)"), and besides it nothing but clock times, a remind-before phrase and plain words.
+// Anything richer ("thứ 6 này … thứ 6 tuần sau", "đến hết thứ 6 tuần sau", "30 phút nữa", "mai", a second
+// weekday) is left to the model, which gets a week-labelled calendar. Even then only the known failure is
+// fixed: the right weekday in the wrong week. A missed correction is harmless unless the model also errs;
+// moving a correct answer is not.
+const WEEKDAY_ALL_RE = new RegExp(`(?<!\\p{L})(?:${WEEKDAY_SRC})(?!\\p{L}|\\d)`, 'gu');
+const WEEK_RELATIVE_WEEKDAY_RE = new RegExp(
+  `(?<!\\p{L})(${WEEKDAY_SRC})\\s+tuần\\s+(?:sau|tới)(\\s+nữa)?(?!\\p{L})`,
+  'u'
 );
+const NEXT_WEEK_START_RE = /(?<!\p{L})đầu\s+tuần\s+(?:sau|tới)(\s+nữa)?(?!\p{L})/u;
+// "9h", "9H30", "15:30", "lúc 8 giờ", "9h kém 15", "8 rưỡi" (a following "sáng/chiều" is a plain word)
+const SIMPLE_CLOCK_RE =
+  /(?<!\p{L})(?:lúc\s+)?\d{1,2}\s*(?:h|giờ|:)\s*(?:\d{1,2}\s*(?:p|phút)?)?(?:\s*kém\s+\d{1,2}(?:\s*(?:p|phút))?|\s*rưỡi)?(?!\p{L})|(?<!\p{L})\d{1,2}\s+rưỡi(?!\p{L})/gu;
+// "nhắc trước 30 phút", "nhắc tôi 1 ngày trước", "báo trước nửa tiếng"
+const SIMPLE_REMIND_BEFORE_RE =
+  /(?<!\p{L})(?:nhắc|báo)(?:\s+(?:tôi|mình|em))?\s+(?:trước\s+(?:\d+|nửa)\s*(?:phút|p|tiếng|giờ|h|ngày|hôm)|(?:\d+|nửa)\s*(?:phút|p|tiếng|giờ|h|ngày|hôm)\s+trước)(?!\p{L})/gu;
+// Any of these left over means the sentence carries other date/time information
+const OTHER_TIME_WORD_RE =
+  /\d|(?<!\p{L})(?:nay|mai|mốt|kia|hôm|ngày|tuần|tháng|năm|giờ|tiếng|phút|nữa|sau|trước|trong|đến|tới|hết|từ|lát|hàng|mỗi|cuối|đầu|thứ|chủ\s*nhật|bây|ngay|liền|sớm|muộn|trễ|hạn|mồng|mùng|rằm|tết)(?!\p{L})/u;
 
 const VALID_RRULE_RE = /^FREQ=(?:DAILY|WEEKLY|MONTHLY|YEARLY)(?:;[A-Z]+=[A-Z0-9,+-]+)*$/;
 
@@ -58,6 +94,27 @@ const R = '(?!\\p{L})';
 const DAY_AFTER_RE = new RegExp(`${L}${NAME_PREFIX}(?:mốt|ngày\\s+kia)${R}`, 'u');
 const TOMORROW_RE = new RegExp(`${L}${NAME_PREFIX}mai${R}`, 'u');
 const TODAY_RE = new RegExp(`${L}(?:hôm\\s+nay|nay)${R}`, 'u');
+// Night wording: "tối thứ 6 tuần sau 0h30" is the small hours of the following calendar day. Night attached
+// to the weekday wins over a clock "2h sáng"; a morning attached to it ("sáng thứ 6") rules the slack out.
+const NIGHT_RE = new RegExp(`${L}(?:tối|đêm|khuya)${R}`, 'u');
+const NIGHT_WEEKDAY_RE = new RegExp(`${L}(?:tối|đêm|khuya)\\s+(?:${WEEKDAY_SRC})`, 'u');
+const MORNING_WEEKDAY_RE = new RegExp(`${L}(?:rạng\\s+)?sáng\\s+(?:${WEEKDAY_SRC})`, 'u');
+// "bắt đầu từ thứ 2 tuần sau": an explicit start for a recurring task ("từ thứ 2 đến thứ 6" is a range of
+// repeat days instead)
+const RECURRENCE_START_SRC = '(?:bắt\\s+đầu(?:\\s+từ)?|kể\\s+từ|từ)\\s+';
+const RANGE_CONNECTOR = '(?:\\s+(?:cho\\s+)?(?:đến|tới)(?:\\s+hết)?\\s+|\\s*[-–]\\s*)';
+const WEEKDAY_RANGE_TAIL = `(?!${RANGE_CONNECTOR}(?:${WEEKDAY_SRC}))`;
+// A weekday that only states when a recurrence starts ("từ thứ 2 tuần sau"), not a day it repeats on
+const RECURRENCE_START_WEEKDAY_RE = new RegExp(
+  `${L}${RECURRENCE_START_SRC}(?:${WEEKDAY_SRC})(?:\\s+tuần\\s+(?:sau|tới|này)(?:\\s+nữa)?)?${WEEKDAY_RANGE_TAIL}`,
+  'giu'
+);
+// "từ thứ 2 (cho) đến (hết) thứ 6", "thứ 2 - thứ 6": every day of the range repeats. A dash chain of three or
+// more ("thứ 2 - thứ 4 - thứ 6") is a list, not a range.
+const WEEKDAY_RANGE_RE = new RegExp(
+  `(?:từ\\s+)?(?<!(?:${WEEKDAY_SRC})\\s*[-–]\\s*)(${WEEKDAY_SRC})${RANGE_CONNECTOR}(${WEEKDAY_SRC})(?!\\s*[-–]\\s*(?:${WEEKDAY_SRC}))`,
+  'giu'
+);
 
 // Detects time phrases left behind in a model-provided title, so we only clean when needed.
 const TIME_RESIDUE_RE =
@@ -116,9 +173,14 @@ export class NlpService {
     dayOfWeek: string,
     timezone: string,
     tzOffset: string,
-    now: Date = new Date()
+    now: Date = new Date(),
+    text = ''
   ): string {
     const calendar = this.buildCalendarTable(now, timezone);
+    const weekTarget = this.resolveWeekRelativeDate(text, now, timezone);
+    const weekHint = weekTarget
+      ? `\n"${weekTarget.phrase}" trong câu của người dùng = ${weekTarget.iso} (${weekTarget.dayName}). Dùng ngày này làm mốc cho cụm đó.\n`
+      : '';
     return `
 Bạn là bộ máy phân tích thời gian và công việc tiếng Việt chính xác tuyệt đối.
 Thời gian hệ thống hiện tại của người dùng là: ${currentIso} (${dayOfWeek}).
@@ -126,7 +188,7 @@ Múi giờ của người dùng: ${timezone} (UTC${tzOffset}).
 
 Lịch 15 ngày tới (dùng bảng này để suy ra ngày, KHÔNG tự tính thứ):
 ${calendar}
-
+${weekHint}
 Nhiệm vụ: Phân tích câu nói của người dùng và trả về JSON theo đúng schema.
 
 QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH XÁC):
@@ -153,7 +215,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
    - "Mai", "trưa mai", "sáng mai", "chiều mai", "tối mai": ngày hiện tại + 1 ngày.
      VD: "trưa mai làm báo cáo" -> ngày mai lúc 12:00:00${tzOffset}, title: "Làm báo cáo".
    - "Mốt", "ngày kia", "trưa mốt", "sáng mốt", "chiều mốt", "tối mốt": ngày hiện tại + 2 ngày.
-   - "Thứ X tuần sau" / "Thứ X tuần tới": ngày Thứ X có nhãn [tuần sau] trong bảng lịch (Tuần bắt đầu từ Thứ Hai), KHÔNG phải Thứ X gần nhất của [tuần này]. "Thứ X tuần này": ngày Thứ X có nhãn [tuần này]. "Thứ X" không kèm "tuần": ngày Thứ X gần nhất sắp tới.
+   - "Thứ X tuần sau" / "Thứ X tuần tới": ngày Thứ X có nhãn [tuần sau] trong bảng lịch (Tuần bắt đầu từ Thứ Hai), KHÔNG phải Thứ X gần nhất của [tuần này]. "Thứ X tuần sau nữa": ngày Thứ X có nhãn [tuần sau nữa]. "Thứ X tuần này": ngày Thứ X có nhãn [tuần này]. "Thứ X" không kèm "tuần": ngày Thứ X gần nhất sắp tới.
    - "X ngày nữa", "sau X ngày": ngày hiện tại + X ngày. "Đầu tuần sau": Thứ Hai tuần sau. "Cuối tuần": Thứ Bảy gần nhất. "Cuối tháng": ngày cuối cùng của tháng hiện tại.
    - Giờ "kém": "9h kém 15" = 08:45. "Rưỡi" = :30. "Khuya"/"đêm": 23:00 nếu không nói giờ.
    - Nếu chỉ nói ngày mà không nói giờ: mặc định 09:00:00.
@@ -191,15 +253,14 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     const labels = ['Hôm nay', 'Ngày mai', 'Ngày mốt'];
     // Weeks start on Monday; label each row so "tuần sau" never has to be inferred by the model
     const weekLabels = ['tuần này', 'tuần sau', 'tuần sau nữa'];
-    const { weekdayShort } = getLocalDateParts(now, timezone);
-    const daysFromMonday = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].indexOf(weekdayShort);
+    const today = getLocalDateParts(now, timezone);
+    const daysFromMonday = daysSinceMonday(new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay());
     for (let i = 0; i < 15; i++) {
-      const d = new Date(now.getTime() + i * 24 * 60 * 60 * 1000);
-      const p = getLocalDateParts(d, timezone);
-      const iso = `${p.year}-${String(p.month).padStart(2, '0')}-${String(p.day).padStart(2, '0')}`;
+      // Step calendar days (not 24h instants) so DST changes never skip or repeat a date
+      const d = new Date(Date.UTC(today.year, today.month - 1, today.day + i));
       const label = labels[i] ? ` (${labels[i]})` : '';
-      const week = weekLabels[Math.floor((Math.max(daysFromMonday, 0) + i) / 7)];
-      rows.push(`- ${iso}: ${getVietnameseDayOfWeek(d, timezone)} [${week}]${label}`);
+      const week = weekLabels[Math.floor((daysFromMonday + i) / 7)];
+      rows.push(`- ${this.formatYmd(d)}: ${getVietnameseDayOfWeek(d, 'UTC')} [${week}]${label}`);
     }
     return rows.join('\n');
   }
@@ -247,7 +308,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     }
 
     // 2. PRIMARY: Call Google Gemini API with Structured Outputs
-    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset, now);
+    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset, now, text);
     const modelsToTry = this.getCandidateModels();
 
     const startOverall = Date.now();
@@ -373,7 +434,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       };
     }
 
-    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset, now);
+    const systemPrompt = this.getSystemPrompt(currentIso, dayOfWeek, timezone, tzOffset, now, text);
     const modelsToTry = this.getCandidateModels();
 
     let finalResult: NlpExtractedTask | null = null;
@@ -582,8 +643,13 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
     currentIso: string,
     timezone: string = DEFAULT_TZ
   ): NlpExtractedTask {
+    // The regex parser is expensive and several branches below may consult it; run it at most once
+    let regexResult: NlpExtractedTask | null | undefined;
+    const regexParse = (): NlpExtractedTask | null =>
+      regexResult === undefined ? (regexResult = this.fastPatternParse(text, currentIso)) : regexResult;
+
     if (parsed.intent === 'UNKNOWN') {
-      const fastFallback = this.fastPatternParse(text, currentIso);
+      const fastFallback = regexParse();
       if (fastFallback) {
         return fastFallback;
       }
@@ -645,10 +711,15 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         parsed.due_at_iso = null;
       }
 
+      const weekTarget = this.resolveWeekRelativeDate(text, new Date(currentIso), timezone);
+
       if (!parsed.due_at_iso) {
-        const regexTask = this.fastPatternParse(text, currentIso);
+        const regexTask = regexParse();
         if (regexTask?.due_at_iso) {
-          parsed.due_at_iso = regexTask.due_at_iso;
+          // The regex date can be thrown off by ranges like "9-11h"; an exact week-relative date wins
+          parsed.due_at_iso = weekTarget
+            ? this.moveToLocalDate(regexTask.due_at_iso, weekTarget, timezone)
+            : regexTask.due_at_iso;
           if (parsed.remind_before_minutes === undefined || parsed.remind_before_minutes === null) {
             parsed.remind_before_minutes = regexTask.remind_before_minutes;
           }
@@ -657,10 +728,10 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
           parsed.due_at_iso = new Date(Date.now() + 30 * 60 * 1000).toISOString();
           parsed.time_assumed = true;
         }
-      } else if (WEEK_RELATIVE_DATE_RE.test(text)) {
+      } else if (weekTarget) {
         // Models confuse "thứ 6 tuần sau" with the nearest Friday (esp. early in the week);
-        // the regex parser computes the calendar date exactly, so keep the model's clock time on that date.
-        parsed.due_at_iso = this.alignDateWithRegex(parsed.due_at_iso, text, currentIso, timezone);
+        // keep the model's clock time but move it onto the exactly computed calendar date.
+        parsed.due_at_iso = this.moveToLocalDate(parsed.due_at_iso, weekTarget, timezone);
       }
 
       if (parsed.recurrence_rrule && !VALID_RRULE_RE.test(parsed.recurrence_rrule.trim().toUpperCase())) {
@@ -672,17 +743,41 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       // Weaker models sometimes drop the recurrence; explicit phrases ("hàng tuần", "mỗi ngày") are
       // reliably detectable, so recover rule and first occurrence from the deterministic parser.
       if (!parsed.recurrence_rrule) {
-        const rx = this.fastPatternParse(text, currentIso);
+        const rx = regexParse();
         if (rx?.recurrence_rrule) {
+          // Keep the model's first occurrence (it may be an explicit later start, "từ thứ 2 tuần sau"); the
+          // check below moves it into the future and onto a BYDAY weekday when needed
           parsed.recurrence_rrule = rx.recurrence_rrule;
-          if (rx.due_at_iso) parsed.due_at_iso = rx.due_at_iso;
         }
       }
 
       // A recurring task's first occurrence must be in the future (e.g. "thứ 2 hàng tuần 6h" said on Monday 8h)
+      // and on one of its BYDAY weekdays (e.g. "thứ 4 hàng tuần, từ thứ 2 tuần sau" starts on that Wednesday)
       if (parsed.recurrence_rrule && parsed.due_at_iso) {
+        // Pin offset-less model output to the user's timezone before any Date arithmetic
+        parsed.due_at_iso = getNowWithTimezone(new Date(toUtcIso(parsed.due_at_iso, timezone)), timezone);
         const dueMs = new Date(parsed.due_at_iso).getTime();
-        if (!isNaN(dueMs) && dueMs <= Date.now()) {
+        const byDay = parsed.recurrence_rrule.startsWith('FREQ=WEEKLY')
+          ? parsed.recurrence_rrule.match(/BYDAY=([A-Z]{2}(?:,[A-Z]{2})*)(?:;|$)/)?.[1].split(',')
+          : undefined;
+        const local = getLocalDateParts(new Date(dueMs), timezone);
+        const dayCode = (d: Date) => getLocalDateParts(d, timezone).weekdayShort.slice(0, 2).toUpperCase();
+        let onByDay = !byDay || byDay.includes(dayCode(new Date(dueMs)));
+        if (
+          byDay &&
+          !onByDay &&
+          local.hour < 4 &&
+          this.hasNightWording(text.toLowerCase()) &&
+          byDay.includes(dayCode(new Date(dueMs - 24 * 60 * 60 * 1000)))
+        ) {
+          // "12h đêm chủ nhật" is Monday 00:00 on the clock but belongs to Sunday night: shift BYDAY to the
+          // clock's weekday so later occurrences keep the same night instead of drifting to Saturday night
+          const codes = ['SU', 'MO', 'TU', 'WE', 'TH', 'FR', 'SA'];
+          const shifted = byDay.map((c) => codes[(codes.indexOf(c) + 1) % 7]).join(',');
+          parsed.recurrence_rrule = parsed.recurrence_rrule.replace(/BYDAY=[A-Z,]+/, `BYDAY=${shifted}`);
+          onByDay = true;
+        }
+        if (!isNaN(dueMs) && (dueMs <= Date.now() || !onByDay)) {
           try {
             parsed.due_at_iso = calculateNextRecurrence(
               parsed.due_at_iso,
@@ -713,27 +808,98 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
   }
 
   /**
-   * Moves a model-provided due time onto the calendar date resolved by the deterministic parser,
-   * preserving the model's local time of day. Returns the input unchanged if the parser finds no date.
+   * Resolves the calendar date (weeks start on Monday) of a SIMPLE sentence's "thứ X tuần sau/tới (nữa)" or
+   * "đầu tuần sau (nữa)". Returns null for anything richer, leaving the date to the model.
    */
-  private alignDateWithRegex(
-    dueIso: string,
+  private resolveWeekRelativeDate(
     text: string,
-    currentIso: string,
+    now: Date,
+    timezone: string
+  ): {
+    year: number;
+    month: number;
+    day: number;
+    iso: string;
+    dayName: string;
+    phrase: string;
+  } | null {
+    const lower = text.toLowerCase();
+    const weekdayCount = lower.match(WEEKDAY_ALL_RE)?.length ?? 0;
+    const match =
+      weekdayCount === 1 ? lower.match(WEEK_RELATIVE_WEEKDAY_RE) : weekdayCount === 0 ? lower.match(NEXT_WEEK_START_RE) : null;
+    if (!match || match.index === undefined) return null;
+
+    const rest = `${lower.slice(0, match.index)} ${lower.slice(match.index + match[0].length)}`
+      .replace(SIMPLE_REMIND_BEFORE_RE, ' ')
+      .replace(SIMPLE_CLOCK_RE, ' ');
+    if (OTHER_TIME_WORD_RE.test(rest)) return null;
+
+    const weekday = weekdayCount === 1 ? WEEKDAY_INDEX[match[1].replace(/\s+/g, ' ')] : 1;
+    if (weekday === undefined) return null;
+    const targetFromMonday = daysSinceMonday(weekday);
+    const weeksAhead = match[weekdayCount === 1 ? 2 : 1] ? 2 : 1;
+    const phrase = match[0];
+
+    const today = getLocalDateParts(now, timezone);
+    const todayFromMonday = daysSinceMonday(new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay());
+    const target = new Date(
+      Date.UTC(today.year, today.month - 1, today.day - todayFromMonday + 7 * weeksAhead + targetFromMonday)
+    );
+    return {
+      year: target.getUTCFullYear(),
+      month: target.getUTCMonth() + 1,
+      day: target.getUTCDate(),
+      iso: this.formatYmd(target),
+      dayName: getVietnameseDayOfWeek(target, 'UTC'),
+      phrase,
+    };
+  }
+
+  /**
+   * Moves a model-provided due time onto the given local calendar date, keeping its local time of day, when
+   * the model picked the right weekday in the wrong week (a whole number of weeks off). Any other difference
+   * ("sinh nhật thứ 6 tuần sau, nhắc tôi mua quà" answered with the Thursday, "tối thứ 6 … 0h30" answered
+   * with Saturday 00:30) is the model's own reading and is kept. Offset-less model output is read as
+   * user-local time, matching how the webhook stores it.
+   */
+  private moveToLocalDate(
+    dueIso: string,
+    target: { year: number; month: number; day: number },
     timezone: string
   ): string {
-    const regexDue = this.fastPatternParse(text, currentIso)?.due_at_iso;
-    if (!regexDue) return dueIso;
-    const model = getLocalDateParts(new Date(dueIso), timezone);
-    const target = getLocalDateParts(new Date(regexDue), timezone);
-    const dayDiff = Math.round(
-      (Date.UTC(target.year, target.month - 1, target.day) -
-        Date.UTC(model.year, model.month - 1, model.day)) /
-        (24 * 60 * 60 * 1000)
+    const model = getLocalDateParts(new Date(toUtcIso(dueIso, timezone)), timezone);
+    const dayDiff =
+      (Date.UTC(model.year, model.month - 1, model.day) - Date.UTC(target.year, target.month - 1, target.day)) /
+      (24 * 60 * 60 * 1000);
+    if (dayDiff === 0 || dayDiff % 7 !== 0) {
+      return dueIso;
+    }
+    const corrected = zonedTimeToIso(
+      target.year,
+      target.month,
+      target.day,
+      model.hour,
+      model.minute,
+      model.second,
+      timezone
     );
-    if (dayDiff === 0) return dueIso;
-    console.warn(`[NLP-DEBUG] ⚠️ Correcting model date ${dueIso} by ${dayDiff} day(s) to match "${text}"`);
-    return getNowWithTimezone(new Date(new Date(dueIso).getTime() + dayDiff * 24 * 60 * 60 * 1000), timezone);
+    console.warn(`[NLP-DEBUG] ⚠️ Correcting model date ${dueIso} -> ${corrected} (week-relative phrase)`);
+    return corrected;
+  }
+
+  /**
+   * True when the text speaks of the night ("tối thứ 6", "đêm") and not of a weekday morning ("sáng thứ 6"),
+   * so a small-hours time belongs to the evening of the day before.
+   */
+  private hasNightWording(lower: string): boolean {
+    return NIGHT_WEEKDAY_RE.test(lower) || (NIGHT_RE.test(lower) && !MORNING_WEEKDAY_RE.test(lower));
+  }
+
+  /**
+   * Formats a UTC-midnight calendar date as YYYY-MM-DD.
+   */
+  private formatYmd(d: Date): string {
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
   }
 
   /**
@@ -986,18 +1152,21 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
 
     // Check for explicit date: "ngày 20 tháng 12", "ngày 20/12", "20/12/2026", etc.
     const explicitDateMatch = lowerWithoutRemindBefore.match(
-      /(?:ngày\s+)?(\d{1,2})\s*(?:tháng|thg|\/|\-)\s*(\d{1,2})(?:\s*(?:năm|\/|\-)\s*(\d{4}))?(?!\d)/
+      // "9-11h" and "2-3 tiếng" are ranges of hours, not 9 Nov / 2 Mar
+      /(?:ngày\s+)?(\d{1,2})\s*(?:tháng|thg|\/|-)\s*(\d{1,2})(?:\s*(?:năm|\/|-)\s*(\d{4}))?(?!\d|\s*(?:h|giờ|tiếng|phút|p|ngày|tuần|lần)(?!\p{L}))/u
     );
 
     // Check for standalone weekday: "thứ 6", "thứ sáu tuần sau", "chủ nhật"
     const weekdayMatch = lowerWithoutRemindBefore.match(
-      /(?:(thứ\s+(?:hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\s*nhật))(?:\s+(tuần\s+(?:sau|tới|này)))?/
+      new RegExp(`(${WEEKDAY_SRC})(?:\\s+(tuần\\s+(?:sau|tới|này))(\\s+nữa)?)?`, 'u')
     );
 
     const dayAfter = DAY_AFTER_RE.test(lowerWithoutRemindBefore);
     const tomorrow = TOMORROW_RE.test(lowerWithoutRemindBefore);
     const todayWord = TODAY_RE.test(lowerWithoutRemindBefore);
-    const nextMonday = /đầu\s+tuần\s+(?:sau|tới)/.test(lowerWithoutRemindBefore);
+    const nextWeekStartMatch = lowerWithoutRemindBefore.match(/đầu\s+tuần\s+(?:sau|tới)(\s+nữa)?/);
+    const nextMonday = !!nextWeekStartMatch;
+    const weekAfterNext = !!nextWeekStartMatch?.[1];
     const weekendWord = /cuối\s+tuần(?!\s+(?:sau|tới))/.test(lowerWithoutRemindBefore);
     const endOfMonth = /cuối\s+tháng/.test(lowerWithoutRemindBefore);
     const nextWeekOnly = !weekdayMatch && /tuần\s+(?:sau|tới)/.test(lowerWithoutRemindBefore);
@@ -1037,27 +1206,16 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       } else if (weekdayMatch) {
         const rawDay = weekdayMatch[1].replace(/\s+/g, ' ');
         const isNextWeek = !!weekdayMatch[2] && /(?:sau|tới)/.test(weekdayMatch[2]);
-        const weekdayMap: Record<string, number> = {
-          'chủ nhật': 0,
-          'chủnhật': 0,
-          'thứ hai': 1, 'thứ 2': 1,
-          'thứ ba': 2, 'thứ 3': 2,
-          'thứ tư': 3, 'thứ 4': 3,
-          'thứ năm': 4, 'thứ 5': 4,
-          'thứ sáu': 5, 'thứ 6': 5,
-          'thứ bảy': 6, 'thứ 7': 6,
-        };
-        const targetWeekday = weekdayMap[rawDay] ?? 1;
+        const targetWeekday = WEEKDAY_INDEX[rawDay] ?? 1;
         const todayDate = new Date(Date.UTC(baseY, baseM - 1, baseD));
         const currentWeekday = todayDate.getUTCDay();
 
         let daysUntil: number;
         if (isNextWeek) {
           // Calculate Monday of next week (ISO week starts Monday)
-          const daysFromMonday = (currentWeekday + 6) % 7;
-          const daysToNextMonday = 7 - daysFromMonday;
-          const targetOffsetFromMonday = (targetWeekday + 6) % 7;
-          daysUntil = daysToNextMonday + targetOffsetFromMonday;
+          const daysToNextMonday = 7 - daysSinceMonday(currentWeekday);
+          const targetOffsetFromMonday = daysSinceMonday(targetWeekday);
+          daysUntil = daysToNextMonday + targetOffsetFromMonday + (weekdayMatch[3] ? 7 : 0);
         } else {
           daysUntil = targetWeekday - currentWeekday;
           const timeAlreadyPassedToday =
@@ -1083,7 +1241,7 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
         } else if (tomorrow) {
           dayOffset = 1;
         } else if (nextMonday) {
-          dayOffset = 7 - ((currentWeekday + 6) % 7);
+          dayOffset = 7 - daysSinceMonday(currentWeekday) + (weekAfterNext ? 7 : 0);
         } else if (nextWeekOnly) {
           dayOffset = 7;
         } else if (weekendWord) {
@@ -1220,7 +1378,17 @@ QUY TẮC QUY ĐỔI THỜI GIAN TIẾNG VIỆT (BẮT BUỘC TUÂN THỦ CHÍNH
       };
       const jsWeekday: Record<string, number> = { SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6 };
       const codes: string[] = [];
-      for (const m of lower.matchAll(/thứ\s+(hai|ba|tư|năm|sáu|bảy|[2-7])|chủ\s*nhật/g)) {
+      const repeatDays = lower
+        .replace(WEEKDAY_RANGE_RE, (_m, from: string, to: string) => {
+          const start = daysSinceMonday(WEEKDAY_INDEX[from.replace(/\s+/g, ' ')] ?? 1);
+          const end = daysSinceMonday(WEEKDAY_INDEX[to.replace(/\s+/g, ' ')] ?? 1);
+          const names = ['thứ 2', 'thứ 3', 'thứ 4', 'thứ 5', 'thứ 6', 'thứ 7', 'chủ nhật'];
+          // "từ thứ 7 đến thứ 2" wraps through Sunday
+          const days = end >= start ? names.slice(start, end + 1) : [...names.slice(start), ...names.slice(0, end + 1)];
+          return days.join(' ');
+        })
+        .replace(RECURRENCE_START_WEEKDAY_RE, ' ');
+      for (const m of repeatDays.matchAll(WEEKDAY_CODE_RE)) {
         const code = m[1] ? codeMap[m[1]] : 'SU';
         if (code && !codes.includes(code)) codes.push(code);
       }

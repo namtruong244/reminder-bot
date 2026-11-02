@@ -140,6 +140,45 @@ export function getTimezoneOffsetString(date: Date = new Date(), timezone: strin
 }
 
 /**
+ * Days elapsed since Monday for a JS weekday index (0 = Sunday): Monday -> 0, Sunday -> 6.
+ */
+export function daysSinceMonday(jsWeekday: number): number {
+  return (jsWeekday + 6) % 7;
+}
+
+/**
+ * Converts a wall-clock time in the timezone to an ISO string carrying the offset in effect at that
+ * moment (DST-safe, unlike adding 24h multiples to an instant). Day/month overflow is normalized.
+ */
+export function zonedTimeToIso(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  timezone: string = DEFAULT_TZ
+): string {
+  const wallMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const offsetMs = (at: number): number => {
+    const m = getTimezoneOffsetString(new Date(at), timezone).match(/^([+-])(\d{2}):(\d{2})$/);
+    if (!m) return 0;
+    return (m[1] === '-' ? -1 : 1) * (parseInt(m[2], 10) * 60 + parseInt(m[3], 10)) * 60000;
+  };
+  // Second pass corrects the guess when the offset differs between the wall time and the real instant
+  let utcMs = wallMs - offsetMs(wallMs);
+  utcMs = wallMs - offsetMs(utcMs);
+  const p = getLocalDateParts(new Date(utcMs), timezone);
+  if (Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) !== wallMs) {
+    // The wall time falls in a DST gap: apply the pre-transition (smaller) offset so it moves forward
+    // by the gap length and stays on the requested date, whatever the sign of the zone's offset
+    const dayMs = 24 * 60 * 60 * 1000;
+    utcMs = wallMs - Math.min(offsetMs(wallMs - dayMs), offsetMs(wallMs + dayMs));
+  }
+  return getNowWithTimezone(new Date(utcMs), timezone);
+}
+
+/**
  * Parses any ISO string (or Date) and returns standard UTC ISO string (e.g., "2026-10-21T08:00:00.000Z").
  * If the input string has no timezone offset, it is assumed to be in the user's timezone.
  */

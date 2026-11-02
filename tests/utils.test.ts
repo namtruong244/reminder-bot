@@ -11,6 +11,7 @@ import {
   getDayRangeUtc,
   escapeMarkdown,
   getDaysInMonth,
+  zonedTimeToIso,
 } from '../src/utils/datetime';
 
 describe('Crypto Utils', () => {
@@ -117,5 +118,19 @@ describe('Datetime & Markdown Utils', () => {
     const raw = 'Review file_v1_final *urgent* `code` [link]';
     const escaped = escapeMarkdown(raw);
     expect(escaped).toBe('Review file\\_v1\\_final \\*urgent\\* \\`code\\` \\[link]');
+  });
+});
+
+describe('zonedTimeToIso', () => {
+  it('uses the offset in effect on the target date', () => {
+    expect(zonedTimeToIso(2026, 10, 30, 9, 0, 0, 'Europe/Berlin')).toBe('2026-10-30T09:00:00+01:00');
+    expect(zonedTimeToIso(2026, 10, 23, 9, 0, 0, 'Europe/Berlin')).toBe('2026-10-23T09:00:00+02:00');
+    expect(zonedTimeToIso(2026, 12, 32, 8, 0, 0, 'Asia/Ho_Chi_Minh')).toBe('2027-01-01T08:00:00+07:00');
+  });
+
+  it('moves a DST-gap time forward and keeps it on the requested date', () => {
+    expect(zonedTimeToIso(2026, 3, 29, 2, 30, 0, 'Europe/Berlin')).toBe('2026-03-29T03:30:00+02:00');
+    expect(zonedTimeToIso(2026, 3, 8, 2, 30, 0, 'America/New_York')).toBe('2026-03-08T03:30:00-04:00');
+    expect(zonedTimeToIso(2026, 9, 6, 0, 0, 0, 'America/Santiago')).toBe('2026-09-06T01:00:00-03:00');
   });
 });
